@@ -130,7 +130,7 @@ def load_system_resources():
     resources = {}
 
     # A. Load Data
-    filename = "Cleaned_amazon_dataset.csv"
+    filename = "Cleaned amazon dataset.csv"
     if os.path.exists(filename):
         df = pd.read_csv(filename)
         if 'combined_text' not in df.columns:
@@ -484,3 +484,4 @@ if prompt:
     # --- UPDATE: Reset Image and Rerun ---
     st.session_state.uploader_key += 1
     st.rerun()
+
