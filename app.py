@@ -1,26 +1,21 @@
 import os
-# --- 1. CRITICAL MAC CRASH FIXES (Must be at the very top) ---
-# This prevents the conflict between PyTorch and FAISS
+# --- 1. CONFIG & SETUP ---
+# Fixes for local Mac/Windows setups (harmless on Cloud)
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["OMP_NUM_THREADS"] = "1"
 
 import streamlit as st
 import pandas as pd
 import faiss
 import pickle
 import torch
-import numpy as np # Added for type safety
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 from sentence_transformers import CrossEncoder
 from openai import OpenAI
 
-# Force PyTorch to use 1 thread to avoid fighting with Streamlit
-torch.set_num_threads(1)
-
 # -----------------------------------------------------------------------------
-# 1. PAGE CONFIG & MODERN CSS
+# 2. PAGE CONFIG & MODERN CSS
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="AI Smart Shopper",
@@ -127,7 +122,7 @@ st.markdown("""
 
 
 # -----------------------------------------------------------------------------
-# 2. CACHED RESOURCE LOADING
+# 3. CACHED RESOURCE LOADING
 # -----------------------------------------------------------------------------
 @st.cache_resource
 def load_system_resources():
@@ -135,7 +130,7 @@ def load_system_resources():
     resources = {}
 
     # A. Load Data
-    filename = "Cleaned amazon dataset.csv"
+    filename = "Cleaned_amazon_dataset.csv"
     if os.path.exists(filename):
         df = pd.read_csv(filename)
         if 'combined_text' not in df.columns:
@@ -150,8 +145,7 @@ def load_system_resources():
         return None
 
     # B. Load AI Models
-    # Force CPU to avoid Mac MPS crash
-    device = "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     resources['device'] = device
 
     with st.spinner(f"Initializing AI Core (Device: {device})..."):
@@ -159,7 +153,7 @@ def load_system_resources():
         resources['clip_model'] = CLIPModel.from_pretrained(model_name).to(device)
         resources['clip_processor'] = CLIPProcessor.from_pretrained(model_name)
 
-        rerank_device = device # Keep consistency
+        rerank_device = device if device != "mps" else "cpu"
         resources['reranker'] = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', device=rerank_device)
 
     # C. Load FAISS Indexes
@@ -186,7 +180,7 @@ sys_res = load_system_resources()
 
 
 # -----------------------------------------------------------------------------
-# 3. BACKEND LOGIC
+# 4. BACKEND LOGIC
 # -----------------------------------------------------------------------------
 
 def retrieve_products(query, modality="text", k=5):
@@ -200,11 +194,9 @@ def retrieve_products(query, modality="text", k=5):
         with torch.no_grad():
             q_emb = sys_res['clip_model'].get_text_features(**inputs)
         q_emb = q_emb / q_emb.norm(p=2, dim=-1, keepdim=True)
+        q_emb = q_emb.cpu().numpy()
 
-        # --- FIX: Cast to float32 to prevent FAISS Segfault ---
-        q_emb_np = q_emb.cpu().detach().numpy().astype('float32')
-
-        D, I = sys_res['text_index'].search(q_emb_np, k)
+        D, I = sys_res['text_index'].search(q_emb, k)
         results = sys_res['df'].iloc[I[0]]
 
     elif modality == "image":
@@ -212,11 +204,9 @@ def retrieve_products(query, modality="text", k=5):
         with torch.no_grad():
             q_emb = sys_res['clip_model'].get_image_features(**inputs)
         q_emb = q_emb / q_emb.norm(p=2, dim=-1, keepdim=True)
+        q_emb = q_emb.cpu().numpy()
 
-        # --- FIX: Cast to float32 ---
-        q_emb_np = q_emb.cpu().detach().numpy().astype('float32')
-
-        D, I = sys_res['image_index'].search(q_emb_np, k)
+        D, I = sys_res['image_index'].search(q_emb, k)
 
         if len(sys_res['valid_indices']) > 0:
             mapped_indices = [sys_res['valid_indices'][i] for i in I[0]]
@@ -239,32 +229,25 @@ def retrieve_and_rerank(query, k_final=5, k_initial=50):
     return ranked_results.sort_values('rerank_score', ascending=False).head(k_final)
 
 
-def generate_bot_response(user_query, image_input, api_key, chat_history):
+def generate_bot_response(user_query, image_input, api_key, chat_history): # Added chat_history
     client = OpenAI(api_key=api_key)
 
-    # Build history string
-    history_str = ""
-    for msg in chat_history[-4:]:
-        history_str += f"{msg['role'].upper()}: {msg['content']}\n"
-
-    def rewrite_query(user_input, history):
+    def rewrite_query(user_input):
         """
         Standardizes and EXPANDS the user query to ensure the database finds relevant items.
-        NOW WITH CONTEXT AWARENESS.
         """
         system_prompt = (
             "You are a Search Query Optimizer. "
-            "Your goal is to ensure the database finds relevant functional alternatives based on User Input and History.\n"
+            "Your goal is to ensure the database finds relevant functional alternatives.\n"
             "### INSTRUCTIONS:\n"
-            "1. **Check for Topic Switch (CRITICAL):** Look at the 'Chat History'. If the user's new input implies a new topic (e.g., switched from 'skateboards' to 'rabbits'), IGNORE the old topic. Recency determines the topic.\n"
-            "2. **Remove Noise:** Delete polite phrases (e.g., 'show me', 'can I get').\n"
-            "3. **Expand Brands to Categories:**\n"
+            "1. **Remove Noise:** Delete polite phrases (e.g., 'show me', 'can I get').\n"
+            "2. **Expand Brands to Categories:**\n"
             "   - Input: 'AirPods' -> Output: 'AirPods Earbuds Headphones In-Ear'\n"
             "   - Input: 'iPhone' -> Output: 'iPhone Smartphone Mobile'\n"
             "   - Input: 'GoPro' -> Output: 'GoPro Action Camera Video'\n"
-            "4. **Expand Categories:**\n"
+            "3. **Expand Categories:**\n"
             "   - Input: 'Skateboard' -> Output: 'Skateboard Longboard Cruiser Deck'\n"
-            "5. Output ONLY the final optimized search string."
+            "4. Output ONLY the final optimized search string."
         )
 
         try:
@@ -272,7 +255,7 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
                 model="gpt-3.5-turbo",
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"CHAT HISTORY (Oldest to Newest):\n{history}\n\nUSER INPUT: {user_input}"}
+                    {"role": "user", "content": user_input}
                 ],
                 temperature=0
             )
@@ -285,14 +268,13 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
     # 1. Retrieval
     if image_input:
         retrieved_products = retrieve_products(image_input, modality="image", k=5)
-        sys_prompt = "You are a visual AI assistant. Identify the object in the image and recommend similar products."
-        context_intro = "I analyzed the uploaded image. Here are visually similar products from the inventory:"
+        sys_prompt = "You are a helpful visual AI assistant. The user has uploaded an image and asked a question.\n### INSTRUCTIONS:\n1. **Answer First:** Identify the object and answer the user's specific question.\n2. **Recommend Second:** List matching products from the context.\n3. **STRICT FORMATTING:**\n   - **Name:** [Exact Product Name]\n   - **Image:** `![Product Name](Image_URL)`\n   - **Link:** `[Click to Buy](Product_URL)`\n"
+        context_intro = "I analyzed the image you uploaded. Here are the most visually similar products:"
     else:
-        # Pass history to rewriter
-        optimized_query = rewrite_query(user_query, history_str)
+        # retrieved_products = retrieve_and_rerank(user_query, k_final=5)
+        optimized_query = rewrite_query(user_query)
         retrieved_products = retrieve_and_rerank(optimized_query, k_final=5, k_initial=50)
-
-        # Original System Prompt (Kept exactly as requested)
+        # sys_prompt = "You are a helpful sales assistant. Recommend best products based on function and relevance."
         sys_prompt = (
             "You are a helpful sales assistant. Your goal is to recommend the best products based on function.\n"
             "### RULES:\n"
@@ -305,12 +287,11 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
             "   - **Tier 3 (Irrelevant):** 'Drone', 'Air Filter', 'Airplane'. -> **NEVER SHOW THESE** for headphone requests.\n"
             "3. **STRICT FORMATTING:**\n"
             "   - **Name:** [Exact Product Name]\n"
-            "   - **Description:** [Description]\n"
-            # "   - **Image:** `![Product Name](Image_URL)`\n"
-            "   - **Link:** `[View on Amazon](Product_URL)`"
+            "   - **Image:** `![Product Name](Image_URL)`\n"
+            "   - **Link:** `[Click to Buy](Product_URL)`"
         )
         context_intro = (
-            f"The user is searching for '{optimized_query}' (Original input: {user_query}). "
+            f"The user is searching for '{user_query}'. "
             "Scan the inventory below. "
             "Prioritize FUNCTION over text matches (e.g., reject 'Air Drones' if user wants 'AirPods')."
         )
@@ -319,9 +300,9 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
     if retrieved_products.empty:
         return "I couldn't find any relevant products in the database.", retrieved_products
 
-    context_str = "*** INVENTORY ***\n"
+    context_str = "*** INVENTORY CANDIDATES ***\n"
     for i, row in retrieved_products.iterrows():
-        context_str += f"Item {i + 1}:\n"
+        context_str += f"Item {i+1}:\n"
         context_str += f"- Name: {row['Product Name']}\n"
         context_str += f"- Link: {str(row['Product Url'])}\n"
 
@@ -337,15 +318,22 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
         context_str += f"- Category: {cat}\n"
         context_str += f"- Description: {desc[:300]}...\n\n"
 
-    # 3. Generation
+    # 3. Generation (Updated with Memory)
+    
+    # Construct message list with history
+    messages_payload = [{"role": "system", "content": sys_prompt}]
+    
+    for msg in chat_history:
+        if msg["role"] in ["user", "assistant"]:
+            messages_payload.append({"role": msg["role"], "content": msg["content"]})
+            
+    # Add current query with context
+    messages_payload.append({"role": "user", "content": f"Context:\n{context_str}\n\n{context_intro}\nUser Input: {user_query}"})
+
     try:
         response = client.chat.completions.create(
             model="gpt-4o",
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                # Pass History + Context
-                {"role": "user", "content": f"Previous Chat History:\n{history_str}\n\nContext:\n{context_str}\n\n{context_intro}\nUser Question: {user_query}"}
-            ],
+            messages=messages_payload,
             temperature=0.3
         )
         return response.choices[0].message.content, retrieved_products
@@ -354,7 +342,7 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
 
 
 # -----------------------------------------------------------------------------
-# 4. UI HELPER FUNCTIONS
+# 5. UI HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
 
 def display_product_grid(df):
@@ -395,7 +383,7 @@ def display_product_grid(df):
 
 
 # -----------------------------------------------------------------------------
-# 5. MAIN UI LAYOUT
+# 6. MAIN UI LAYOUT
 # -----------------------------------------------------------------------------
 
 # --- Sidebar: Settings & Upload ---
@@ -404,11 +392,20 @@ with st.sidebar:
     api_key = st.text_input("OpenAI API Key", type="password", help="Enter your SK- key here")
 
     st.divider()
+    
+    # --- UPDATE: Initialize Uploader Key ---
+    if "uploader_key" not in st.session_state:
+        st.session_state.uploader_key = 0
 
     st.markdown("### 🖼️ Visual Search")
     st.info("Upload an image here, then hit Enter in the chat box to search.")
 
-    uploaded_file = st.file_uploader("Upload Image...", type=["jpg", "png", "jpeg"])
+    # --- UPDATE: Use Dynamic Key ---
+    uploaded_file = st.file_uploader(
+        "Upload Image...", 
+        type=["jpg", "png", "jpeg"],
+        key=f"uploader_{st.session_state.uploader_key}"
+    )
 
     current_image = None
     if uploaded_file:
@@ -463,12 +460,11 @@ if prompt:
     # AI Generation
     with st.chat_message("assistant"):
         with st.spinner("Analyzing intent and searching inventory..."):
-
-            # --- UPDATE: Pass the history to the function ---
+            # --- UPDATE: Pass Chat History ---
             response_text, products_df = generate_bot_response(
-                user_text,
-                user_image,
-                api_key,
+                user_text, 
+                user_image, 
+                api_key, 
                 st.session_state.messages
             )
 
@@ -484,3 +480,7 @@ if prompt:
         "content": response_text,
         "products": products_df
     })
+    
+    # --- UPDATE: Reset Image and Rerun ---
+    st.session_state.uploader_key += 1
+    st.rerun()
