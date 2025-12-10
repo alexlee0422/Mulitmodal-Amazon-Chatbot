@@ -1,0 +1,11 @@
+altair
+pandas
+streamlit
+pandas
+numpy
+faiss-cpu
+torch
+transformers
+sentence-transformers
+openai
+Pillow
