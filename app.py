@@ -130,6 +130,7 @@ def load_system_resources():
     resources = {}
 
     # A. Load Data
+    # --- FIX 1: Corrected Filename ---
     filename = "Cleaned amazon dataset.csv"
     if os.path.exists(filename):
         df = pd.read_csv(filename)
@@ -229,33 +230,48 @@ def retrieve_and_rerank(query, k_final=5, k_initial=50):
     return ranked_results.sort_values('rerank_score', ascending=False).head(k_final)
 
 
-def generate_bot_response(user_query, image_input, api_key, chat_history): # Added chat_history
+def generate_bot_response(user_query, image_input, api_key, chat_history):
     client = OpenAI(api_key=api_key)
 
-    def rewrite_query(user_input):
+    # --- FIX 2: Contextual Rewriting with History ---
+    def rewrite_query(user_input, history):
         """
-        Standardizes and EXPANDS the user query to ensure the database finds relevant items.
+        Uses LLM to:
+        1. Decide if this is a product search or just chat.
+        2. Merge current input with chat history for context (e.g. "in white" -> "white teddy bear")
         """
+        # Extract last 2-3 exchanges for context
+        context_text = ""
+        for msg in history[-3:]: 
+            role = msg["role"]
+            content = msg.get("content", "")
+            if role in ["user", "assistant"]:
+                context_text += f"{role}: {content}\n"
+
         system_prompt = (
             "You are a Search Query Optimizer. "
-            "Your goal is to ensure the database finds relevant functional alternatives.\n"
+            "Your goal is to interpret the user's intent based on conversation history.\n"
             "### INSTRUCTIONS:\n"
-            "1. **Remove Noise:** Delete polite phrases (e.g., 'show me', 'can I get').\n"
-            "2. **Expand Brands to Categories:**\n"
-            "   - Input: 'AirPods' -> Output: 'AirPods Earbuds Headphones In-Ear'\n"
-            "   - Input: 'iPhone' -> Output: 'iPhone Smartphone Mobile'\n"
-            "   - Input: 'GoPro' -> Output: 'GoPro Action Camera Video'\n"
-            "3. **Expand Categories:**\n"
-            "   - Input: 'Skateboard' -> Output: 'Skateboard Longboard Cruiser Deck'\n"
-            "4. Output ONLY the final optimized search string."
+            "1. **Analyze Intent:**\n"
+            "   - If the user is just saying hello, thanks, or chatting without asking for a product, output exactly: `NO_SEARCH`.\n"
+            "   - If the user is searching, continue to step 2.\n"
+            "2. **Contextualize:**\n"
+            "   - If the user says 'it', 'that one', 'in red', or refines a previous search, combine it with the previous product context.\n"
+            "   - Example: History='Show me skateboards', Input='in blue' -> Output='blue skateboard'.\n"
+            "3. **Clean & Expand:**\n"
+            "   - Remove polite phrases ('show me').\n"
+            "   - Expand brands (AirPods -> Earbuds).\n"
+            "4. Output ONLY the final optimized search string (or `NO_SEARCH`)."
         )
+        
+        user_prompt = f"Chat History:\n{context_text}\nUser Input: {user_input}"
 
         try:
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_input}
+                    {"role": "user", "content": user_prompt}
                 ],
                 temperature=0
             )
@@ -265,69 +281,65 @@ def generate_bot_response(user_query, image_input, api_key, chat_history): # Add
         except:
             return user_input
 
-    # 1. Retrieval
+    # 1. Retrieval Logic
     if image_input:
+        # VISUAL PATH (Always search if image provided)
         retrieved_products = retrieve_products(image_input, modality="image", k=5)
-        sys_prompt = "You are a helpful visual AI assistant. The user has uploaded an image and asked a question.\n### INSTRUCTIONS:\n1. **Answer First:** Identify the object and answer the user's specific question.\n2. **Recommend Second:** List matching products from the context.\n3. **STRICT FORMATTING:**\n   - **Name:** [Exact Product Name]\n   - **Image:** `![Product Name](Image_URL)`\n   - **Link:** `[Click to Buy](Product_URL)`\n"
-        context_intro = "I analyzed the image you uploaded. Here are the most visually similar products:"
+        sys_prompt = "You are a visual AI assistant. Identify the object in the image and recommend similar products."
+        context_intro = "I analyzed the uploaded image. Here are visually similar products from the inventory:"
     else:
-        # retrieved_products = retrieve_and_rerank(user_query, k_final=5)
-        optimized_query = rewrite_query(user_query)
-        retrieved_products = retrieve_and_rerank(optimized_query, k_final=5, k_initial=50)
-        # sys_prompt = "You are a helpful sales assistant. Recommend best products based on function and relevance."
-        sys_prompt = (
-            "You are a helpful sales assistant. Your goal is to recommend the best products based on function.\n"
-            "### RULES:\n"
-            "1. **Determine Intent:**\n"
-            "   - **Broad:** (e.g., 'party'). Recommend **3 distinct options**.\n"
-            "   - **Specific:** (e.g., 'AirPods'). Find that item or the closest **functional** alternative.\n"
-            "2. **Relevance Hierarchy (Follow Strictly):**\n"
-            "   - **Tier 1 (Direct Match):** 'AirPods', 'Headphones', 'Earbuds'. -> SHOW THESE FIRST.\n"
-            "   - **Tier 2 (Functional Fallback):** If NO Headphones exist, look for **Audio Gear** (e.g., 'Speakers', 'Soundbars'). -> SHOW THESE with a note ('I don't have headphones, but here are some speakers...').\n"
-            "   - **Tier 3 (Irrelevant):** 'Drone', 'Air Filter', 'Airplane'. -> **NEVER SHOW THESE** for headphone requests.\n"
-            "3. **STRICT FORMATTING:**\n"
-            "   - **Name:** [Exact Product Name]\n"
-            "   - **Image:** `![Product Name](Image_URL)`\n"
-            "   - **Link:** `[Click to Buy](Product_URL)`"
-        )
-        context_intro = (
-            f"The user is searching for '{user_query}'. "
-            "Scan the inventory below. "
-            "Prioritize FUNCTION over text matches (e.g., reject 'Air Drones' if user wants 'AirPods')."
-        )
-
-    # 2. Context
-    if retrieved_products.empty:
-        return "I couldn't find any relevant products in the database.", retrieved_products
-
-    context_str = "*** INVENTORY CANDIDATES ***\n"
-    for i, row in retrieved_products.iterrows():
-        context_str += f"Item {i+1}:\n"
-        context_str += f"- Name: {row['Product Name']}\n"
-        context_str += f"- Link: {str(row['Product Url'])}\n"
-
-        raw_img_url = str(row['Image'])
-        if "|" in raw_img_url:
-            clean_img_url = raw_img_url.split("|")[0]
+        # TEXT PATH (Conditional Search)
+        optimized_query = rewrite_query(user_query, chat_history)
+        
+        # --- FIX 3: Conditional Retrieval ---
+        if optimized_query == "NO_SEARCH":
+            # Skip search, return empty DF. The UI will NOT show the grid.
+            retrieved_products = pd.DataFrame()
+            sys_prompt = "You are a helpful AI assistant. Engage in conversation politely. Do not invent products."
+            context_intro = "The user is chatting with you. Reply naturally."
         else:
-            clean_img_url = raw_img_url
-        context_str += f"- Image_URL: {clean_img_url}\n"
+            # Perform search with the CONTEXT-AWARE query
+            retrieved_products = retrieve_and_rerank(optimized_query, k_final=5, k_initial=50)
+            sys_prompt = (
+                "You are a helpful sales assistant. Your goal is to recommend the best products based on function.\n"
+                "### RULES:\n"
+                "1. **Relevance Hierarchy:** Prioritize direct matches, then functional fallbacks. Never show irrelevant items.\n"
+                "2. **STRICT FORMATTING:** Name, Description, Link."
+            )
+            context_intro = (
+                f"The user is searching for '{optimized_query}'. "
+                "Prioritize FUNCTION over text matches."
+            )
 
-        cat = str(row['Category']) if 'Category' in row else "General"
-        desc = str(row['full_description']) if 'full_description' in row else str(row.get('About Product', ''))
-        context_str += f"- Category: {cat}\n"
-        context_str += f"- Description: {desc[:300]}...\n\n"
+    # 2. Context Construction
+    if retrieved_products.empty:
+        # If no search happened (NO_SEARCH) or no results found, handle gracefully
+        context_str = "No specific inventory context for this turn."
+    else:
+        context_str = "*** INVENTORY CANDIDATES ***\n"
+        for i, row in retrieved_products.iterrows():
+            context_str += f"Item {i+1}:\n"
+            context_str += f"- Name: {row['Product Name']}\n"
+            context_str += f"- Link: {str(row['Product Url'])}\n"
 
-    # 3. Generation (Updated with Memory)
-    
-    # Construct message list with history
+            raw_img_url = str(row['Image'])
+            if "|" in raw_img_url:
+                clean_img_url = raw_img_url.split("|")[0]
+            else:
+                clean_img_url = raw_img_url
+            context_str += f"- Image_URL: {clean_img_url}\n"
+
+            cat = str(row['Category']) if 'Category' in row else "General"
+            desc = str(row['full_description']) if 'full_description' in row else str(row.get('About Product', ''))
+            context_str += f"- Category: {cat}\n"
+            context_str += f"- Description: {desc[:300]}...\n\n"
+
+    # 3. Generation (with History)
     messages_payload = [{"role": "system", "content": sys_prompt}]
-    
     for msg in chat_history:
         if msg["role"] in ["user", "assistant"]:
             messages_payload.append({"role": msg["role"], "content": msg["content"]})
             
-    # Add current query with context
     messages_payload.append({"role": "user", "content": f"Context:\n{context_str}\n\n{context_intro}\nUser Input: {user_query}"})
 
     try:
@@ -348,25 +360,19 @@ def generate_bot_response(user_query, image_input, api_key, chat_history): # Add
 def display_product_grid(df):
     """
     Renders the products in a perfect 3-column grid.
-    Fixes the vertical stacking issue.
     """
     if df.empty:
         return
 
     st.markdown("### 🛍️ Recommended Products")
-
-    # Create the columns OUTSIDE the loop
     cols = st.columns(3)
 
     for i, (idx, row) in enumerate(df.iterrows()):
-        # Handle Amazon multi-images (split by |)
         raw_img = str(row['Image'])
         img_url = raw_img.split("|")[0] if "|" in raw_img else raw_img
 
         category = str(row['Category']) if 'Category' in row else "Product"
 
-        # Use HTML/CSS for the Fancy Card
-        # The key is using cols[i % 3] to cycle through columns 0, 1, 2
         with cols[i % 3]:
             st.markdown(f"""
             <div class="product-card">
@@ -393,14 +399,12 @@ with st.sidebar:
 
     st.divider()
     
-    # --- UPDATE: Initialize Uploader Key ---
     if "uploader_key" not in st.session_state:
         st.session_state.uploader_key = 0
 
     st.markdown("### 🖼️ Visual Search")
     st.info("Upload an image here, then hit Enter in the chat box to search.")
 
-    # --- UPDATE: Use Dynamic Key ---
     uploaded_file = st.file_uploader(
         "Upload Image...", 
         type=["jpg", "png", "jpeg"],
@@ -428,9 +432,9 @@ for message in st.session_state.messages:
         if "image_data" in message and message["image_data"]:
             st.image(message["image_data"], width=200)
 
+        # Only display grid if products exist in that turn
         if "products" in message and not message["products"].empty:
             st.markdown("---")
-            # CALL THE GRID FUNCTION TO ENSURE HORIZONTAL LAYOUT
             display_product_grid(message["products"])
 
 # --- Fixed Input at Bottom ---
@@ -460,7 +464,6 @@ if prompt:
     # AI Generation
     with st.chat_message("assistant"):
         with st.spinner("Analyzing intent and searching inventory..."):
-            # --- UPDATE: Pass Chat History ---
             response_text, products_df = generate_bot_response(
                 user_text, 
                 user_image, 
@@ -470,6 +473,7 @@ if prompt:
 
             st.markdown(response_text)
 
+            # --- Grid Condition: Only show if products were returned ---
             if not products_df.empty:
                 st.markdown("---")
                 display_product_grid(products_df)
@@ -481,7 +485,6 @@ if prompt:
         "products": products_df
     })
     
-    # --- UPDATE: Reset Image and Rerun ---
+    # Reset Image and Rerun
     st.session_state.uploader_key += 1
     st.rerun()
-
