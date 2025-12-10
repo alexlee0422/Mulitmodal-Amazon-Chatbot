@@ -130,7 +130,6 @@ def load_system_resources():
     resources = {}
 
     # A. Load Data
-    # --- FIX 1: Corrected Filename ---
     filename = "Cleaned amazon dataset.csv"
     if os.path.exists(filename):
         df = pd.read_csv(filename)
@@ -233,7 +232,6 @@ def retrieve_and_rerank(query, k_final=5, k_initial=50):
 def generate_bot_response(user_query, image_input, api_key, chat_history):
     client = OpenAI(api_key=api_key)
 
-    # --- FIX 2: Contextual Rewriting with History ---
     def rewrite_query(user_input, history):
         """
         Uses LLM to:
@@ -248,12 +246,14 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
             if role in ["user", "assistant"]:
                 context_text += f"{role}: {content}\n"
 
+        # --- UPDATED PROMPT: STRICTER SEARCH DETECTION ---
         system_prompt = (
             "You are a Search Query Optimizer. "
             "Your goal is to interpret the user's intent based on conversation history.\n"
             "### INSTRUCTIONS:\n"
             "1. **Analyze Intent:**\n"
-            "   - If the user is just saying hello, thanks, or chatting without asking for a product, output exactly: `NO_SEARCH`.\n"
+            "   - If the user is just saying hello, thanks, or chatting without asking for a product (e.g. 'hi', 'how are you', 'cool'), output exactly: `NO_SEARCH`.\n"
+            "   - If the user inputs a product name or keyword (e.g. 'teddy bear', 'skateboard', 'camera'), even without a verb, TREAT IT AS A SEARCH.\n"
             "   - If the user is searching, continue to step 2.\n"
             "2. **Contextualize:**\n"
             "   - If the user says 'it', 'that one', 'in red', or refines a previous search, combine it with the previous product context.\n"
@@ -291,7 +291,6 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
         # TEXT PATH (Conditional Search)
         optimized_query = rewrite_query(user_query, chat_history)
         
-        # --- FIX 3: Conditional Retrieval ---
         if optimized_query == "NO_SEARCH":
             # Skip search, return empty DF. The UI will NOT show the grid.
             retrieved_products = pd.DataFrame()
@@ -300,11 +299,14 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
         else:
             # Perform search with the CONTEXT-AWARE query
             retrieved_products = retrieve_and_rerank(optimized_query, k_final=5, k_initial=50)
+            
+            # --- UPDATED PROMPT: NO SMALL TALK ---
             sys_prompt = (
                 "You are a helpful sales assistant. Your goal is to recommend the best products based on function.\n"
                 "### RULES:\n"
-                "1. **Relevance Hierarchy:** Prioritize direct matches, then functional fallbacks. Never show irrelevant items.\n"
-                "2. **STRICT FORMATTING:** Name, Description, Link."
+                "1. **Directness:** If the user inputs a product name (e.g. 'teddy bear'), immediately list the products from the inventory. Do not give general definitions or history lessons.\n"
+                "2. **Relevance Hierarchy:** Prioritize direct matches, then functional fallbacks. Never show irrelevant items.\n"
+                "3. **STRICT FORMATTING:** Name, Description, Link."
             )
             context_intro = (
                 f"The user is searching for '{optimized_query}'. "
