@@ -427,7 +427,17 @@ with st.sidebar:
     st.markdown("### 🖼️ Visual Search")
     st.info("Upload an image here, then hit Enter in the chat box to search.")
 
-    uploaded_file = st.file_uploader("Upload Image...", type=["jpg", "png", "jpeg"])
+    # --- FIX START: Session State to track Uploader Key ---
+    if "uploader_key" not in st.session_state:
+        st.session_state.uploader_key = 0
+    # --- FIX END ---
+
+    # --- FIX: Bind uploader to the unique key ---
+    uploaded_file = st.file_uploader(
+        "Upload Image...", 
+        type=["jpg", "png", "jpeg"], 
+        key=f"uploader_{st.session_state.uploader_key}"
+    )
 
     current_image = None
     if uploaded_file:
@@ -503,3 +513,8 @@ if prompt:
         "content": response_text,
         "products": products_df
     })
+
+    # --- FIX: If an image was used, force a reset for the next run ---
+    if user_image is not None:
+        st.session_state.uploader_key += 1
+        st.rerun()
