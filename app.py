@@ -189,8 +189,8 @@ sys_res = load_system_resources()
 # 3. BACKEND LOGIC
 # -----------------------------------------------------------------------------
 
-# --- UPDATED: Added 'search_target' parameter to support switching indexes ---
-def retrieve_products(query, input_type="text", search_target="text_index", k=5):
+# --- UPDATED: Added 'text_modifier' parameter to support Multimodal Retrieval ---
+def retrieve_products(query, input_type="text", search_target="text_index", k=5, text_modifier=None):
     if sys_res['text_index'] is None: return pd.DataFrame()
 
     results = pd.DataFrame()
@@ -201,10 +201,26 @@ def retrieve_products(query, input_type="text", search_target="text_index", k=5)
         inputs = sys_res['clip_processor'](text=[query], return_tensors="pt", padding=True).to(device)
         with torch.no_grad():
             q_emb = sys_res['clip_model'].get_text_features(**inputs)
+    
     elif input_type == "image":
+        # Get Image Embedding
         inputs = sys_res['clip_processor'](images=query, return_tensors="pt").to(device)
         with torch.no_grad():
-            q_emb = sys_res['clip_model'].get_image_features(**inputs)
+            img_emb = sys_res['clip_model'].get_image_features(**inputs)
+            img_emb = img_emb / img_emb.norm(p=2, dim=-1, keepdim=True)
+        
+        # --- FIX: Multimodal Embedding Combination ---
+        if text_modifier and len(text_modifier.strip()) > 0:
+            # Get Text Embedding for the modifier (e.g., "white")
+            text_inputs = sys_res['clip_processor'](text=[text_modifier], return_tensors="pt", padding=True).to(device)
+            with torch.no_grad():
+                text_emb = sys_res['clip_model'].get_text_features(**text_inputs)
+                text_emb = text_emb / text_emb.norm(p=2, dim=-1, keepdim=True)
+            
+            # Combine: Image + Text (Steering the vector)
+            q_emb = img_emb + text_emb
+        else:
+            q_emb = img_emb
 
     q_emb = q_emb / q_emb.norm(p=2, dim=-1, keepdim=True)
 
@@ -234,7 +250,7 @@ def retrieve_and_rerank(query, mode="functional", k_final=5, k_initial=50):
     else:
         # Text Input -> Search Text Index (Standard)
         initial_results = retrieve_products(query, input_type="text", search_target="text_index", k=k_initial)
-
+        
     if initial_results.empty: return initial_results
 
     product_texts = initial_results['combined_text'].tolist()
@@ -294,13 +310,29 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
 
     # 1. Retrieval
     if image_input:
-        retrieved_products = retrieve_products(image_input, input_type="image", search_target="image_index", k=5)
-        sys_prompt = "You are a visual AI assistant. Identify the object in the image and recommend similar products."
-        context_intro = "I analyzed the uploaded image. Here are visually similar products from the inventory:"
+        # --- FIX: Multimodal Retrieval Call ---
+        # We pass the user_query as a modifier (e.g. "white") to steer the image search
+        retrieved_products = retrieve_products(
+            image_input, 
+            input_type="image", 
+            search_target="image_index", 
+            k=5, 
+            text_modifier=user_query
+        )
+        
+        # --- FIX: Updated Prompt for External Reference ---
+        sys_prompt = (
+            "You are a visual AI assistant. The user has uploaded an EXTERNAL reference image "
+            "and may have provided text constraints (e.g., 'white'). "
+            "The products listed below are VISUALLY SIMILAR recommendations found in the database, "
+            "NOT necessarily the exact item in the uploaded image. "
+            "If the user asked for a color/style change, emphasize items that match that new constraint."
+        )
+        context_intro = "I analyzed the uploaded image and any text constraints. Here are the closest matches from our inventory:"
     else:
         # Pass history to rewriter
         optimized_query_raw = rewrite_query(user_query, history_str)
-
+        
         # --- UPDATE: Parse the [VISUAL] tag ---
         if "[VISUAL]" in optimized_query_raw:
             search_mode = "visual"
@@ -434,8 +466,8 @@ with st.sidebar:
 
     # --- FIX: Bind uploader to the unique key ---
     uploaded_file = st.file_uploader(
-        "Upload Image...",
-        type=["jpg", "png", "jpeg"],
+        "Upload Image...", 
+        type=["jpg", "png", "jpeg"], 
         key=f"uploader_{st.session_state.uploader_key}"
     )
 
