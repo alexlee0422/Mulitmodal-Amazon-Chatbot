@@ -15,7 +15,7 @@ Built on the **Amazon Product Dataset 2020**, the system processes approximately
 ## 🚀 Live Demo
 
 Try the application live on Hugging Face Spaces:
-👉 **[Launch AI Shopper]([https://mulitmodal-amazon-chatbot-dq5fvxecykrzwy68zltzdh.streamlit.app/])**
+👉 **[Launch AI Shopper](https://mulitmodal-amazon-chatbot-dq5fvxecykrzwy68zltzdh.streamlit.app)**
 
 ---
 
