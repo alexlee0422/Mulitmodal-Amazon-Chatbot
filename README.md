@@ -18,7 +18,9 @@ Try the application live on Hugging Face Spaces:
 👉 **[Launch AI Shopper](https://mulitmodal-amazon-chatbot-dq5fvxecykrzwy68zltzdh.streamlit.app)**
 
 **Some Examples:**
+<img width="1036" height="831" alt="Screenshot 2025-12-13 at 9 50 44 PM" src="https://github.com/user-attachments/assets/9baf1bea-5952-4c12-a29e-193ffb49f252" />
 <img width="1635" height="849" alt="Screenshot 2025-12-13 at 9 36 41 PM" src="https://github.com/user-attachments/assets/0dc236b7-3287-4aa2-a1c0-eed057720f5a" />
+
 
 
 
