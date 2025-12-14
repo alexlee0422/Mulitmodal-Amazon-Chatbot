@@ -10,7 +10,7 @@ import pandas as pd
 import faiss
 import pickle
 import torch
-import numpy as np # Added for type safety
+import numpy as np 
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 from sentence_transformers import CrossEncoder
@@ -29,73 +29,59 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for "Fancy" UI (Glassmorphism + Hover Effects)
+# Custom CSS for "Fancy" UI
 st.markdown("""
 <style>
-    /* Global Background tweaks (optional, keeps Streamlit dark mode) */
-
-    /* Chat Message Bubble Styling */
     .stChatMessage {
         border-radius: 12px;
         border: 1px solid rgba(255, 255, 255, 0.1);
     }
-
-    /* THE PRODUCT CARD - The core of the fancy UI */
     .product-card {
-        background: rgba(40, 40, 45, 0.6); /* Semi-transparent dark */
-        backdrop-filter: blur(10px);        /* Glass blur effect */
+        background: rgba(40, 40, 45, 0.6);
+        backdrop-filter: blur(10px);
         border-radius: 16px;
         padding: 16px;
         margin-bottom: 24px;
         border: 1px solid rgba(255, 255, 255, 0.1);
         box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
         transition: all 0.3s ease-in-out;
-        height: 380px; /* Fixed height for alignment */
+        height: 380px; 
         display: flex;
         flex-direction: column;
         justify-content: space-between;
     }
-
-    /* Hover Effect: Lift up and Glow */
     .product-card:hover {
         transform: translateY(-8px);
         box-shadow: 0 10px 20px rgba(0, 0, 0, 0.4);
-        border-color: #FF4B4B; /* Streamlit Red Accent */
+        border-color: #FF4B4B;
     }
-
-    /* Image Container to keep images proportional */
     .img-container {
         width: 100%;
         height: 180px;
         border-radius: 10px;
         overflow: hidden;
         margin-bottom: 12px;
-        background-color: #fff; /* White bg for product images */
+        background-color: #fff;
         display: flex;
         align-items: center;
         justify-content: center;
     }
-
     .img-container img {
         max-height: 100%;
         max-width: 100%;
         object-fit: contain;
     }
-
-    /* Typography */
     .product-title {
         font-size: 15px;
         font-weight: 600;
         color: #f0f0f0;
         margin-bottom: 8px;
         line-height: 1.4;
-        /* Truncate text after 2 lines */
         display: -webkit-box;
         -webkit-line-clamp: 2;
         -webkit-box-orient: vertical;
         overflow: hidden;
     }
-
     .product-cat {
         font-size: 12px;
         color: #aaaaaa;
@@ -103,8 +89,6 @@ st.markdown("""
         text-transform: uppercase;
         letter-spacing: 0.5px;
     }
-
-    /* Buy Button */
     .buy-btn {
         display: block;
         width: 100%;
@@ -150,7 +134,6 @@ def load_system_resources():
         return None
 
     # B. Load AI Models
-    # Force CPU to avoid Mac MPS crash
     device = "cpu"
     resources['device'] = device
 
@@ -159,7 +142,7 @@ def load_system_resources():
         resources['clip_model'] = CLIPModel.from_pretrained(model_name).to(device)
         resources['clip_processor'] = CLIPProcessor.from_pretrained(model_name)
 
-        rerank_device = device # Keep consistency
+        rerank_device = device 
         resources['reranker'] = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', device=rerank_device)
 
     # C. Load FAISS Indexes
@@ -189,66 +172,81 @@ sys_res = load_system_resources()
 # 3. BACKEND LOGIC
 # -----------------------------------------------------------------------------
 
-# --- UPDATED: Added 'text_modifier' parameter to support Multimodal Retrieval ---
+# --- UPDATED: SEQUENTIAL RERANKING LOGIC ---
 def retrieve_products(query, input_type="text", search_target="text_index", k=5, text_modifier=None):
     if sys_res['text_index'] is None: return pd.DataFrame()
 
     results = pd.DataFrame()
     device = sys_res['device']
 
-    # 1. Generate Embedding based on Input Type
+    # --- SCENARIO 1: TEXT ONLY (Standard Search) ---
     if input_type == "text":
         inputs = sys_res['clip_processor'](text=[query], return_tensors="pt", padding=True).to(device)
         with torch.no_grad():
             q_emb = sys_res['clip_model'].get_text_features(**inputs)
-    
+        
+        q_emb = q_emb / q_emb.norm(p=2, dim=-1, keepdim=True)
+        q_emb_np = q_emb.cpu().detach().numpy().astype('float32')
+        
+        if search_target == "text_index":
+            D, I = sys_res['text_index'].search(q_emb_np, k)
+            results = sys_res['df'].iloc[I[0]]
+        elif search_target == "image_index":
+            D, I = sys_res['image_index'].search(q_emb_np, k)
+            if len(sys_res['valid_indices']) > 0:
+                mapped_indices = [sys_res['valid_indices'][i] for i in I[0]]
+                results = sys_res['df'].iloc[mapped_indices]
+
+    # --- SCENARIO 2: IMAGE INPUT (With optional Text Modifier) ---
     elif input_type == "image":
-        # Get Image Embedding
+        # Step 1: Get Image Embedding
         inputs = sys_res['clip_processor'](images=query, return_tensors="pt").to(device)
         with torch.no_grad():
             img_emb = sys_res['clip_model'].get_image_features(**inputs)
             img_emb = img_emb / img_emb.norm(p=2, dim=-1, keepdim=True)
         
-        # --- FIX: Multimodal Embedding Combination ---
-        if text_modifier and len(text_modifier.strip()) > 0:
-            # Get Text Embedding for the modifier (e.g., "white")
-            text_inputs = sys_res['clip_processor'](text=[text_modifier], return_tensors="pt", padding=True).to(device)
-            with torch.no_grad():
-                text_emb = sys_res['clip_model'].get_text_features(**text_inputs)
-                text_emb = text_emb / text_emb.norm(p=2, dim=-1, keepdim=True)
-            
-            # Combine: Image + Text (Steering the vector)
-            q_emb = img_emb + text_emb
-        else:
-            q_emb = img_emb
+        q_emb_np = img_emb.cpu().detach().numpy().astype('float32')
 
-    q_emb = q_emb / q_emb.norm(p=2, dim=-1, keepdim=True)
-
-    # --- FIX: Cast to float32 to prevent FAISS Segfault ---
-    q_emb_np = q_emb.cpu().detach().numpy().astype('float32')
-
-    # 2. Search the Requested Index (Target)
-    if search_target == "text_index":
-        D, I = sys_res['text_index'].search(q_emb_np, k)
-        results = sys_res['df'].iloc[I[0]]
-
-    elif search_target == "image_index":
-        D, I = sys_res['image_index'].search(q_emb_np, k)
+        # Step 2: Initial Visual Search (Get Top 50 candidates)
+        # We fetch a larger pool to increase the odds of finding the specific color/variant
+        k_candidates = 50 
+        D, I = sys_res['image_index'].search(q_emb_np, k_candidates)
 
         if len(sys_res['valid_indices']) > 0:
             mapped_indices = [sys_res['valid_indices'][i] for i in I[0]]
-            results = sys_res['df'].iloc[mapped_indices]
+            candidate_df = sys_res['df'].iloc[mapped_indices].copy()
+        else:
+            return pd.DataFrame()
+
+        # Step 3: APPLY TEXT MODIFIER (Sequential Reranking)
+        # If user provided text (e.g., "white"), we resort the 50 candidates by that text
+        if text_modifier and len(text_modifier.strip()) > 0:
+            
+            # We use the CrossEncoder (Reranker) to score how well the 
+            # text descriptions of the 50 visual matches align with the user's text constraint.
+            
+            product_texts = candidate_df['combined_text'].tolist()
+            # Create pairs for the CrossEncoder: [("white", "Bear Description 1"), ("white", "Bear Description 2")...]
+            pairs = [[text_modifier, text] for text in product_texts]
+            
+            # Predict similarity scores
+            scores = sys_res['reranker'].predict(pairs)
+            candidate_df['rerank_score'] = scores
+            
+            # Sort by the new score (Text Match) and take top k
+            results = candidate_df.sort_values('rerank_score', ascending=False).head(k)
+            
+        else:
+            # No text provided, just return top k visual matches
+            results = candidate_df.head(k)
 
     return results
 
 
 def retrieve_and_rerank(query, mode="functional", k_final=5, k_initial=50):
-    # --- UPDATE: Logic to switch between Visual and Functional search ---
     if mode == "visual":
-        # Text Input -> Search Image Index (Finds items that "look like" the text)
         return retrieve_products(query, input_type="text", search_target="image_index", k=k_final)
     else:
-        # Text Input -> Search Text Index (Standard)
         initial_results = retrieve_products(query, input_type="text", search_target="text_index", k=k_initial)
         
     if initial_results.empty: return initial_results
@@ -266,17 +264,11 @@ def retrieve_and_rerank(query, mode="functional", k_final=5, k_initial=50):
 def generate_bot_response(user_query, image_input, api_key, chat_history):
     client = OpenAI(api_key=api_key)
 
-    # Build history string
     history_str = ""
     for msg in chat_history[-4:]:
         history_str += f"{msg['role'].upper()}: {msg['content']}\n"
 
-    # --- UPDATED: Keeps your original logic but adds the [VISUAL] tag check ---
     def rewrite_query(user_input, history):
-        """
-        Standardizes and EXPANDS the user query to ensure the database finds relevant items.
-        NOW WITH CONTEXT AWARENESS.
-        """
         system_prompt = (
             "You are a Search Query Optimizer. "
             "Your goal is to ensure the database finds relevant functional alternatives based on User Input and History.\n"
@@ -310,30 +302,30 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
 
     # 1. Retrieval
     if image_input:
-        # --- FIX: Multimodal Retrieval Call ---
-        # We pass the user_query as a modifier (e.g. "white") to steer the image search
+        # Use the Rewriter to get the "clean" constraint text (e.g. "white")
+        # This helps the Reranker work better by removing "I want a..."
+        clean_text_modifier = rewrite_query(user_query, history_str).replace("[VISUAL]", "").replace("[FUNCTIONAL]", "").strip()
+
+        # Call the updated sequential retrieval
         retrieved_products = retrieve_products(
             image_input, 
             input_type="image", 
             search_target="image_index", 
             k=5, 
-            text_modifier=user_query
+            text_modifier=clean_text_modifier
         )
         
-        # --- FIX: Updated Prompt for External Reference ---
         sys_prompt = (
             "You are a visual AI assistant. The user has uploaded an EXTERNAL reference image "
             "and may have provided text constraints (e.g., 'white'). "
-            "The products listed below are VISUALLY SIMILAR recommendations found in the database, "
-            "NOT necessarily the exact item in the uploaded image. "
-            "If the user asked for a color/style change, emphasize items that match that new constraint."
+            "The products listed below are VISUALLY SIMILAR recommendations found in the database. "
+            "If the user provided a text constraint (like color or material), the system has attempted to filter for that. "
+            "Your job is to explain why these items are good matches based on the visual and text inputs."
         )
-        context_intro = "I analyzed the uploaded image and any text constraints. Here are the closest matches from our inventory:"
+        context_intro = "I analyzed the uploaded image and text constraints. Here are the best matches from our inventory:"
     else:
-        # Pass history to rewriter
         optimized_query_raw = rewrite_query(user_query, history_str)
         
-        # --- UPDATE: Parse the [VISUAL] tag ---
         if "[VISUAL]" in optimized_query_raw:
             search_mode = "visual"
             optimized_query = optimized_query_raw.replace("[VISUAL]", "").strip()
@@ -343,7 +335,6 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
 
         retrieved_products = retrieve_and_rerank(optimized_query, mode=search_mode, k_final=5, k_initial=50)
 
-        # Original System Prompt (Kept exactly as requested)
         sys_prompt = (
             "You are a helpful sales assistant. Your goal is to recommend the best products based on function.\n"
             "### RULES:\n"
@@ -357,7 +348,7 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
             "3. **STRICT FORMATTING:**\n"
             "   - **Name:** [Exact Product Name]\n"
             "   - **Description:** [Description]\n"
-            "   - **Image:** `![Product Name](Image_URL)`\n"  # <--- UPDATED: UNCOMMENTED THIS LINE
+            "   - **Image:** `![Product Name](Image_URL)`\n" 
             "   - **Link:** `[View on Amazon](Product_URL)`"
         )
         context_intro = (
@@ -394,7 +385,6 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": sys_prompt},
-                # Pass History + Context
                 {"role": "user", "content": f"Previous Chat History:\n{history_str}\n\nContext:\n{context_str}\n\n{context_intro}\nUser Question: {user_query}"}
             ],
             temperature=0.3
@@ -409,27 +399,17 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
 # -----------------------------------------------------------------------------
 
 def display_product_grid(df):
-    """
-    Renders the products in a perfect 3-column grid.
-    Fixes the vertical stacking issue.
-    """
     if df.empty:
         return
 
     st.markdown("### 🛍️ Recommended Products")
-
-    # Create the columns OUTSIDE the loop
     cols = st.columns(3)
 
     for i, (idx, row) in enumerate(df.iterrows()):
-        # Handle Amazon multi-images (split by |)
         raw_img = str(row['Image'])
         img_url = raw_img.split("|")[0] if "|" in raw_img else raw_img
-
         category = str(row['Category']) if 'Category' in row else "Product"
 
-        # Use HTML/CSS for the Fancy Card
-        # The key is using cols[i % 3] to cycle through columns 0, 1, 2
         with cols[i % 3]:
             st.markdown(f"""
             <div class="product-card">
@@ -449,22 +429,16 @@ def display_product_grid(df):
 # 5. MAIN UI LAYOUT
 # -----------------------------------------------------------------------------
 
-# --- Sidebar: Settings & Upload ---
 with st.sidebar:
     st.title("⚙️ Control Panel")
     api_key = st.text_input("OpenAI API Key", type="password", help="Enter your SK- key here")
-
     st.divider()
-
     st.markdown("### 🖼️ Visual Search")
     st.info("Upload an image here, then hit Enter in the chat box to search.")
 
-    # --- FIX START: Session State to track Uploader Key ---
     if "uploader_key" not in st.session_state:
         st.session_state.uploader_key = 0
-    # --- FIX END ---
 
-    # --- FIX: Bind uploader to the unique key ---
     uploaded_file = st.file_uploader(
         "Upload Image...", 
         type=["jpg", "png", "jpeg"], 
@@ -477,27 +451,21 @@ with st.sidebar:
         st.success("Image Loaded! Press Enter in chat to send.")
         st.image(current_image, caption="Ready to Analyze", use_column_width=True)
 
-# --- Main Chat Area ---
 st.title("🤖 AI Intelligent Shopper")
 st.caption("Powered by CLIP + RAG + LLM")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display History
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
-
         if "image_data" in message and message["image_data"]:
             st.image(message["image_data"], width=200)
-
         if "products" in message and not message["products"].empty:
             st.markdown("---")
-            # CALL THE GRID FUNCTION TO ENSURE HORIZONTAL LAYOUT
             display_product_grid(message["products"])
 
-# --- Fixed Input at Bottom ---
 prompt = st.chat_input("Ask about a product or describe what you need...")
 
 if prompt:
@@ -508,45 +476,36 @@ if prompt:
     user_text = prompt
     user_image = current_image if current_image else None
 
-    # Show User Message
     with st.chat_message("user"):
         if user_image:
             st.image(user_image, width=200)
         st.markdown(user_text)
 
-    # Save to History
     st.session_state.messages.append({
         "role": "user",
         "content": user_text,
         "image_data": user_image
     })
 
-    # AI Generation
     with st.chat_message("assistant"):
         with st.spinner("Analyzing intent and searching inventory..."):
-
-            # --- UPDATE: Pass the history to the function ---
             response_text, products_df = generate_bot_response(
                 user_text,
                 user_image,
                 api_key,
                 st.session_state.messages
             )
-
             st.markdown(response_text)
-
             if not products_df.empty:
                 st.markdown("---")
                 display_product_grid(products_df)
 
-    # Save Assistant Response
     st.session_state.messages.append({
         "role": "assistant",
         "content": response_text,
         "products": products_df
     })
 
-    # --- FIX: If an image was used, force a reset for the next run ---
     if user_image is not None:
         st.session_state.uploader_key += 1
         st.rerun()
