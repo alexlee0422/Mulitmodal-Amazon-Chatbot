@@ -161,9 +161,9 @@ def load_system_resources():
         resources['clip_processor'] = CLIPProcessor.from_pretrained(model_name)
 
         # --- KEY CHANGE: UPGRADED RERANKER ---
-        # Switched from ms-marco-MiniLM (dumb) to BGE-Reranker (smart/context-aware)
+        # Using BAAI/bge-reranker-base (Option 1)
+        # This model is smarter at negation and context than ms-marco-MiniLM
         rerank_device = device
-        # Using 'BAAI/bge-reranker-base' which is better at understanding negation and nuance
         resources['reranker'] = CrossEncoder('BAAI/bge-reranker-base', device=rerank_device)
 
     # C. Load FAISS Indexes
@@ -234,31 +234,31 @@ def retrieve_products(query, input_type="text", search_target="text_index", k=5)
 
 def retrieve_and_rerank(query, mode="functional", k_final=5, k_initial=50):
     """
-    Retrieves and optionally reranks products.
+    Retrieves and ALWAYS reranks products, trusting the better BGE model
+    to handle the 'visual' vs 'text' conflicts.
     """
     
-    # --- KEY CHANGE: VISUAL BYPASS ---
-    # If mode is visual (e.g., "looks like X"), we TRUST the visual search (CLIP)
-    # and skip the text reranker. Text reranking confuses shapes with keywords.
+    # 1. Initial Retrieval (Fetch more candidates to give the reranker options)
     if mode == "visual":
-        return retrieve_products(query, input_type="text", search_target="image_index", k=k_final)
-    
-    # --- Standard Functional Search (Text + Rerank) ---
+        # Search the IMAGE index (looks like X)
+        initial_results = retrieve_products(query, input_type="text", search_target="image_index", k=k_initial)
     else:
-        # 1. Broad Retrieval via FAISS
+        # Search the TEXT index (is X)
         initial_results = retrieve_products(query, input_type="text", search_target="text_index", k=k_initial)
 
-        if initial_results.empty: return initial_results
+    if initial_results.empty: return initial_results
 
-        # 2. Reranking via BGE-Reranker (Smarter model)
-        product_texts = initial_results['combined_text'].tolist()
-        pairs = [[query, text] for text in product_texts]
+    # 2. ALWAYS Rerank (Using the smarter BGE model)
+    # The BGE model should be smart enough to see "Mouse Puppet" and downrank it
+    # even if it was retrieved visually.
+    product_texts = initial_results['combined_text'].tolist()
+    pairs = [[query, text] for text in product_texts]
 
-        scores = sys_res['reranker'].predict(pairs)
-        ranked_results = initial_results.copy()
-        ranked_results['rerank_score'] = scores
+    scores = sys_res['reranker'].predict(pairs)
+    ranked_results = initial_results.copy()
+    ranked_results['rerank_score'] = scores
 
-        return ranked_results.sort_values('rerank_score', ascending=False).head(k_final)
+    return ranked_results.sort_values('rerank_score', ascending=False).head(k_final)
 
 
 def generate_bot_response(user_query, image_input, api_key, chat_history):
