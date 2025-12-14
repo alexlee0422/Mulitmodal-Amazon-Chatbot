@@ -10,7 +10,7 @@ import pandas as pd
 import faiss
 import pickle
 import torch
-import numpy as np # Added for type safety
+import numpy as np
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 from sentence_transformers import CrossEncoder
@@ -138,6 +138,7 @@ def load_system_resources():
     filename = "Cleaned amazon dataset.csv"
     if os.path.exists(filename):
         df = pd.read_csv(filename)
+        # Ensure combined_text exists
         if 'combined_text' not in df.columns:
             def create_rich_text(row):
                 desc = str(row['full_description']) if pd.notna(row['full_description']) else ""
@@ -150,17 +151,20 @@ def load_system_resources():
         return None
 
     # B. Load AI Models
-    # Force CPU to avoid Mac MPS crash
-    device = "cpu"
+    device = "cpu" # Force CPU to avoid Mac MPS crash
     resources['device'] = device
 
     with st.spinner(f"Initializing AI Core (Device: {device})..."):
+        # CLIP for Embeddings
         model_name = "openai/clip-vit-base-patch32"
         resources['clip_model'] = CLIPModel.from_pretrained(model_name).to(device)
         resources['clip_processor'] = CLIPProcessor.from_pretrained(model_name)
 
-        rerank_device = device # Keep consistency
-        resources['reranker'] = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', device=rerank_device)
+        # --- KEY CHANGE: UPGRADED RERANKER ---
+        # Switched from ms-marco-MiniLM (dumb) to BGE-Reranker (smart/context-aware)
+        rerank_device = device
+        # Using 'BAAI/bge-reranker-base' which is better at understanding negation and nuance
+        resources['reranker'] = CrossEncoder('BAAI/bge-reranker-base', device=rerank_device)
 
     # C. Load FAISS Indexes
     if os.path.exists("text.index"):
@@ -189,8 +193,10 @@ sys_res = load_system_resources()
 # 3. BACKEND LOGIC
 # -----------------------------------------------------------------------------
 
-# --- UPDATED: Added 'search_target' parameter to support switching indexes ---
 def retrieve_products(query, input_type="text", search_target="text_index", k=5):
+    """
+    Core retrieval function using FAISS.
+    """
     if sys_res['text_index'] is None: return pd.DataFrame()
 
     results = pd.DataFrame()
@@ -208,7 +214,7 @@ def retrieve_products(query, input_type="text", search_target="text_index", k=5)
 
     q_emb = q_emb / q_emb.norm(p=2, dim=-1, keepdim=True)
 
-    # --- FIX: Cast to float32 to prevent FAISS Segfault ---
+    # Cast to float32 to prevent FAISS Segfault
     q_emb_np = q_emb.cpu().detach().numpy().astype('float32')
 
     # 2. Search the Requested Index (Target)
@@ -227,24 +233,32 @@ def retrieve_products(query, input_type="text", search_target="text_index", k=5)
 
 
 def retrieve_and_rerank(query, mode="functional", k_final=5, k_initial=50):
-    # --- UPDATE: Logic to switch between Visual and Functional search ---
+    """
+    Retrieves and optionally reranks products.
+    """
+    
+    # --- KEY CHANGE: VISUAL BYPASS ---
+    # If mode is visual (e.g., "looks like X"), we TRUST the visual search (CLIP)
+    # and skip the text reranker. Text reranking confuses shapes with keywords.
     if mode == "visual":
-        # Text Input -> Search Image Index (Finds items that "look like" the text)
         return retrieve_products(query, input_type="text", search_target="image_index", k=k_final)
+    
+    # --- Standard Functional Search (Text + Rerank) ---
     else:
-        # Text Input -> Search Text Index (Standard)
+        # 1. Broad Retrieval via FAISS
         initial_results = retrieve_products(query, input_type="text", search_target="text_index", k=k_initial)
 
-    if initial_results.empty: return initial_results
+        if initial_results.empty: return initial_results
 
-    product_texts = initial_results['combined_text'].tolist()
-    pairs = [[query, text] for text in product_texts]
+        # 2. Reranking via BGE-Reranker (Smarter model)
+        product_texts = initial_results['combined_text'].tolist()
+        pairs = [[query, text] for text in product_texts]
 
-    scores = sys_res['reranker'].predict(pairs)
-    ranked_results = initial_results.copy()
-    ranked_results['rerank_score'] = scores
+        scores = sys_res['reranker'].predict(pairs)
+        ranked_results = initial_results.copy()
+        ranked_results['rerank_score'] = scores
 
-    return ranked_results.sort_values('rerank_score', ascending=False).head(k_final)
+        return ranked_results.sort_values('rerank_score', ascending=False).head(k_final)
 
 
 def generate_bot_response(user_query, image_input, api_key, chat_history):
@@ -255,11 +269,9 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
     for msg in chat_history[-4:]:
         history_str += f"{msg['role'].upper()}: {msg['content']}\n"
 
-    # --- UPDATED: Keeps your original logic but adds the [VISUAL] tag check ---
     def rewrite_query(user_input, history):
         """
         Standardizes and EXPANDS the user query to ensure the database finds relevant items.
-        NOW WITH CONTEXT AWARENESS.
         """
         system_prompt = (
             "You are a Search Query Optimizer. "
@@ -273,7 +285,7 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
             "   - Input: 'GoPro' -> Output: 'GoPro Action Camera Video'\n"
             "4. **Expand Categories:**\n"
             "   - Input: 'Skateboard' -> Output: 'Skateboard Longboard Cruiser Deck'\n"
-            "5. **(NEW) DETECT VISUAL INTENT:** If the user describes appearance (e.g., 'looks like', 'red', 'modern style', 'shape'), prepend `[VISUAL]` to your output. Otherwise, prepend `[FUNCTIONAL]`.\n"
+            "5. **DETECT VISUAL INTENT:** If the user describes appearance (e.g., 'looks like', 'red', 'modern style', 'shape'), prepend `[VISUAL]` to your output. Otherwise, prepend `[FUNCTIONAL]`.\n"
             "6. Output ONLY the final optimized search string."
         )
 
@@ -292,16 +304,17 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
         except:
             return f"[FUNCTIONAL] {user_input}"
 
-    # 1. Retrieval
+    # 1. Retrieval Strategy
     if image_input:
+        # Image Upload -> Direct Visual Search
         retrieved_products = retrieve_products(image_input, input_type="image", search_target="image_index", k=5)
         sys_prompt = "You are a visual AI assistant. Identify the object in the image and recommend similar products."
         context_intro = "I analyzed the uploaded image. Here are visually similar products from the inventory:"
     else:
-        # Pass history to rewriter
+        # Text Input -> Rewrite -> Search
         optimized_query_raw = rewrite_query(user_query, history_str)
 
-        # --- UPDATE: Parse the [VISUAL] tag ---
+        # Parse the [VISUAL] tag
         if "[VISUAL]" in optimized_query_raw:
             search_mode = "visual"
             optimized_query = optimized_query_raw.replace("[VISUAL]", "").strip()
@@ -309,23 +322,27 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
             search_mode = "functional"
             optimized_query = optimized_query_raw.replace("[FUNCTIONAL]", "").strip()
 
+        # Pass search mode to retrieval function
         retrieved_products = retrieve_and_rerank(optimized_query, mode=search_mode, k_final=5, k_initial=50)
 
-        # Original System Prompt (Kept exactly as requested)
+        # --- KEY CHANGE: SYSTEM PROMPT ORDERING ---
+        # Updated to ensure the LLM respects the strict order of results
         sys_prompt = (
-            "You are a helpful sales assistant. Your goal is to recommend the best products based on function.\n"
+            "You are a helpful sales assistant. Your goal is to recommend the best products based on the user's specific request.\n"
             "### RULES:\n"
-            "1. **Determine Intent:**\n"
+            "1. **STRICT ORDERING:** You MUST discuss the products in the EXACT order they appear in the Context. Do not reorder them. Item 1 in context must be Item 1 in your answer.\n"
+            "2. **Visual Consistency:** If the user asked for something that 'looks like' X, trust the image context provided, even if the text name seems unrelated.\n"
+            "3. **Determine Intent:**\n"
             "   - **Broad:** (e.g., 'party'). Recommend **3 distinct options**.\n"
             "   - **Specific:** (e.g., 'AirPods'). Find that item or the closest **functional** alternative.\n"
-            "2. **Relevance Hierarchy (Follow Strictly):**\n"
-            "   - **Tier 1 (Direct Match):** 'AirPods', 'Headphones', 'Earbuds'. -> SHOW THESE FIRST.\n"
-            "   - **Tier 2 (Functional Fallback):** If NO Headphones exist, look for **Audio Gear** (e.g., 'Speakers', 'Soundbars'). -> SHOW THESE with a note ('I don't have headphones, but here are some speakers...').\n"
-            "   - **Tier 3 (Irrelevant):** 'Drone', 'Air Filter', 'Airplane'. -> **NEVER SHOW THESE** for headphone requests.\n"
-            "3. **STRICT FORMATTING:**\n"
+            "4. **Relevance Hierarchy:**\n"
+            "   - **Tier 1 (Direct Match):** 'AirPods', 'Headphones'. -> SHOW THESE FIRST.\n"
+            "   - **Tier 2 (Functional Fallback):** If NO Headphones exist, look for **Audio Gear**.\n"
+            "   - **Tier 3 (Irrelevant):** 'Drone', 'Air Filter'. -> **NEVER SHOW THESE** for headphone requests.\n"
+            "5. **STRICT FORMATTING:**\n"
             "   - **Name:** [Exact Product Name]\n"
             "   - **Description:** [Description]\n"
-            "   - **Image:** `![Product Name](Image_URL)`\n"  # <--- UPDATED: UNCOMMENTED THIS LINE
+            "   - **Image:** `![Product Name](Image_URL)`\n"
             "   - **Link:** `[View on Amazon](Product_URL)`"
         )
         context_intro = (
@@ -334,23 +351,24 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
             "Prioritize FUNCTION over text matches (e.g., reject 'Air Drones' if user wants 'AirPods')."
         )
 
-    # 2. Context
+    # 2. Context Building
     if retrieved_products.empty:
         return "I couldn't find any relevant products in the database.", retrieved_products
 
     context_str = "*** INVENTORY ***\n"
     for i, row in retrieved_products.iterrows():
-        context_str += f"Item {i + 1}:\n"
-        context_str += f"- Name: {row['Product Name']}\n"
-        context_str += f"- Link: {str(row['Product Url'])}\n"
-
+        # Clean up Image URL (handle pipes)
         raw_img_url = str(row['Image'])
         if "|" in raw_img_url:
             clean_img_url = raw_img_url.split("|")[0]
         else:
             clean_img_url = raw_img_url
-        context_str += f"- Image_URL: {clean_img_url}\n"
 
+        context_str += f"Item {i + 1}:\n"
+        context_str += f"- Name: {row['Product Name']}\n"
+        context_str += f"- Link: {str(row['Product Url'])}\n"
+        context_str += f"- Image_URL: {clean_img_url}\n"
+        
         cat = str(row['Category']) if 'Category' in row else "General"
         desc = str(row['full_description']) if 'full_description' in row else str(row.get('About Product', ''))
         context_str += f"- Category: {cat}\n"
@@ -362,7 +380,6 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": sys_prompt},
-                # Pass History + Context
                 {"role": "user", "content": f"Previous Chat History:\n{history_str}\n\nContext:\n{context_str}\n\n{context_intro}\nUser Question: {user_query}"}
             ],
             temperature=0.3
@@ -379,25 +396,20 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
 def display_product_grid(df):
     """
     Renders the products in a perfect 3-column grid.
-    Fixes the vertical stacking issue.
     """
     if df.empty:
         return
 
     st.markdown("### 🛍️ Recommended Products")
 
-    # Create the columns OUTSIDE the loop
     cols = st.columns(3)
 
     for i, (idx, row) in enumerate(df.iterrows()):
-        # Handle Amazon multi-images (split by |)
         raw_img = str(row['Image'])
         img_url = raw_img.split("|")[0] if "|" in raw_img else raw_img
 
         category = str(row['Category']) if 'Category' in row else "Product"
 
-        # Use HTML/CSS for the Fancy Card
-        # The key is using cols[i % 3] to cycle through columns 0, 1, 2
         with cols[i % 3]:
             st.markdown(f"""
             <div class="product-card">
@@ -427,12 +439,9 @@ with st.sidebar:
     st.markdown("### 🖼️ Visual Search")
     st.info("Upload an image here, then hit Enter in the chat box to search.")
 
-    # --- FIX START: Session State to track Uploader Key ---
     if "uploader_key" not in st.session_state:
         st.session_state.uploader_key = 0
-    # --- FIX END ---
 
-    # --- FIX: Bind uploader to the unique key ---
     uploaded_file = st.file_uploader(
         "Upload Image...",
         type=["jpg", "png", "jpeg"],
@@ -447,7 +456,7 @@ with st.sidebar:
 
 # --- Main Chat Area ---
 st.title("🤖 AI Intelligent Shopper")
-st.caption("Powered by CLIP + RAG + LLM")
+st.caption("Powered by CLIP + RAG + LLM (BGE-Reranker)")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -462,10 +471,9 @@ for message in st.session_state.messages:
 
         if "products" in message and not message["products"].empty:
             st.markdown("---")
-            # CALL THE GRID FUNCTION TO ENSURE HORIZONTAL LAYOUT
             display_product_grid(message["products"])
 
-# --- Fixed Input at Bottom ---
+# --- Input Area ---
 prompt = st.chat_input("Ask about a product or describe what you need...")
 
 if prompt:
@@ -493,7 +501,6 @@ if prompt:
     with st.chat_message("assistant"):
         with st.spinner("Analyzing intent and searching inventory..."):
 
-            # --- UPDATE: Pass the history to the function ---
             response_text, products_df = generate_bot_response(
                 user_text,
                 user_image,
@@ -514,7 +521,7 @@ if prompt:
         "products": products_df
     })
 
-    # --- FIX: If an image was used, force a reset for the next run ---
+    # Reset uploader if an image was used
     if user_image is not None:
         st.session_state.uploader_key += 1
         st.rerun()
