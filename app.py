@@ -258,6 +258,7 @@ def retrieve_and_rerank(query, mode="functional", k_final=5, k_initial=50):
     ranked_results = initial_results.copy()
     ranked_results['rerank_score'] = scores
 
+    # --- ORDER FIX: Sort strictly by score ---
     return ranked_results.sort_values('rerank_score', ascending=False).head(k_final)
 
 
@@ -269,6 +270,7 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
         history_str += f"{msg['role'].upper()}: {msg['content']}\n"
 
     def rewrite_query(user_input, history):
+        # --- LOGIC FIX: Updated Prompt to handle negation and visual look-alikes ---
         system_prompt = (
             "You are a Search Query Optimizer. "
             "Your goal is to ensure the database finds relevant functional alternatives based on User Input and History.\n"
@@ -278,10 +280,12 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
             "3. **Expand Brands to Categories:**\n"
             "   - Input: 'AirPods' -> Output: 'AirPods Earbuds Headphones In-Ear'\n"
             "   - Input: 'iPhone' -> Output: 'iPhone Smartphone Mobile'\n"
-            "   - Input: 'GoPro' -> Output: 'GoPro Action Camera Video'\n"
             "4. **Expand Categories:**\n"
             "   - Input: 'Skateboard' -> Output: 'Skateboard Longboard Cruiser Deck'\n"
-            "5. **(NEW) DETECT VISUAL INTENT:** If the user describes appearance (e.g., 'looks like', 'red', 'modern style', 'shape'), prepend `[VISUAL]` to your output. Otherwise, prepend `[FUNCTIONAL]`.\n"
+            "5. **(NEW) DETECT VISUAL/NEGATION INTENT:** \n"
+            "   - If the user says 'looks like X but is not X' (e.g., 'looks like a wireless mouse but is not actually one'), generate visual search terms for the APPEARANCE (e.g., 'mouse shaped soap', 'mouse toy').\n"
+            "   - Prepend `[VISUAL]` if the request is about appearance/shape. \n"
+            "   - Prepend `[FUNCTIONAL]` if it is about utility.\n"
             "6. Output ONLY the final optimized search string."
         )
 
@@ -302,11 +306,8 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
 
     # 1. Retrieval
     if image_input:
-        # Use the Rewriter to get the "clean" constraint text (e.g. "white")
-        # This helps the Reranker work better by removing "I want a..."
         clean_text_modifier = rewrite_query(user_query, history_str).replace("[VISUAL]", "").replace("[FUNCTIONAL]", "").strip()
 
-        # Call the updated sequential retrieval
         retrieved_products = retrieve_products(
             image_input, 
             input_type="image", 
@@ -317,12 +318,11 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
         
         sys_prompt = (
             "You are a visual AI assistant. The user has uploaded an EXTERNAL reference image "
-            "and may have provided text constraints (e.g., 'white'). "
-            "The products listed below are VISUALLY SIMILAR recommendations found in the database. "
-            "If the user provided a text constraint (like color or material), the system has attempted to filter for that. "
-            "Your job is to explain why these items are good matches based on the visual and text inputs."
+            "and may have provided text constraints. "
+            "The products listed are VISUALLY SIMILAR matches from the database. "
+            "Explain why these items are good matches based on the visual and text inputs."
         )
-        context_intro = "I analyzed the uploaded image and text constraints. Here are the best matches from our inventory:"
+        context_intro = "I analyzed the uploaded image and text constraints. Here are the best matches:"
     else:
         optimized_query_raw = rewrite_query(user_query, history_str)
         
@@ -333,36 +333,33 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
             search_mode = "functional"
             optimized_query = optimized_query_raw.replace("[FUNCTIONAL]", "").strip()
 
+        # This returns the STRICTLY SORTED list based on the reranker
         retrieved_products = retrieve_and_rerank(optimized_query, mode=search_mode, k_final=5, k_initial=50)
 
+        # --- ORDER FIX: Strict Prompting for the LLM ---
         sys_prompt = (
-            "You are a helpful sales assistant. Your goal is to recommend the best products based on function.\n"
+            "You are a helpful sales assistant. Recommend products based STRICTLY on the provided context.\n"
             "### RULES:\n"
-            "1. **Determine Intent:**\n"
-            "   - **Broad:** (e.g., 'party'). Recommend **3 distinct options**.\n"
-            "   - **Specific:** (e.g., 'AirPods'). Find that item or the closest **functional** alternative.\n"
-            "2. **Relevance Hierarchy (Follow Strictly):**\n"
-            "   - **Tier 1 (Direct Match):** 'AirPods', 'Headphones', 'Earbuds'. -> SHOW THESE FIRST.\n"
-            "   - **Tier 2 (Functional Fallback):** If NO Headphones exist, look for **Audio Gear** (e.g., 'Speakers', 'Soundbars'). -> SHOW THESE with a note ('I don't have headphones, but here are some speakers...').\n"
-            "   - **Tier 3 (Irrelevant):** 'Drone', 'Air Filter', 'Airplane'. -> **NEVER SHOW THESE** for headphone requests.\n"
-            "3. **STRICT FORMATTING:**\n"
+            "1. **STRICT ORDERING:** The products in the context are ALREADY sorted by relevance (Item 1 is the best match). "
+            "You MUST present your recommendations in this EXACT numerical order (Item 1, then Item 2, etc.). Do NOT reorder them.\n"
+            "2. **Explain Matches:** For 'looks like X but is not X' queries, explicitly mention *why* the product visually resembles X but isn't one.\n"
+            "3. **Format:**\n"
             "   - **Name:** [Exact Product Name]\n"
-            "   - **Description:** [Description]\n"
-            "   - **Image:** `![Product Name](Image_URL)`\n" 
+            "   - **Reason:** [Why it matches the query]\n"
             "   - **Link:** `[View on Amazon](Product_URL)`"
         )
         context_intro = (
             f"The user is searching for '{optimized_query}' (Original input: {user_query}). "
-            "Scan the inventory below. "
-            "Prioritize FUNCTION over text matches (e.g., reject 'Air Drones' if user wants 'AirPods')."
+            "Scan the inventory below."
         )
 
     # 2. Context
     if retrieved_products.empty:
         return "I couldn't find any relevant products in the database.", retrieved_products
 
-    context_str = "*** INVENTORY ***\n"
+    context_str = "*** INVENTORY (SORTED BY RELEVANCE) ***\n"
     for i, row in retrieved_products.iterrows():
+        # --- ORDER FIX: Numbering items explicitly ---
         context_str += f"Item {i + 1}:\n"
         context_str += f"- Name: {row['Product Name']}\n"
         context_str += f"- Link: {str(row['Product Url'])}\n"
