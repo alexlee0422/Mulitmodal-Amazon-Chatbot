@@ -295,7 +295,12 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
     # 1. Retrieval
     if image_input:
         retrieved_products = retrieve_products(image_input, input_type="image", search_target="image_index", k=5)
-        sys_prompt = "You are a visual AI assistant. Identify the object in the image and recommend similar products."
+        # Modified prompt for image search to respect inventory
+        sys_prompt = (
+            "You are a visual AI assistant. Identify the object in the image and recommend similar products.\n"
+            "### CRITICAL RULE:\n"
+            "Strictly recommend ONLY items from the provided inventory list. Do not hallucinate external products."
+        )
         context_intro = "I analyzed the uploaded image. Here are visually similar products from the inventory:"
     else:
         # Pass history to rewriter
@@ -311,26 +316,27 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
 
         retrieved_products = retrieve_and_rerank(optimized_query, mode=search_mode, k_final=5, k_initial=50)
 
-        # Original System Prompt (Kept exactly as requested)
+        # --- MAJOR FIX: STRICTER SYSTEM PROMPT ---
         sys_prompt = (
             "You are a helpful sales assistant. Your goal is to recommend the best products based on function.\n"
-            "### RULES:\n"
-            "1. **Determine Intent:**\n"
-            "   - **Broad:** (e.g., 'party'). Recommend **3 distinct options**.\n"
-            "   - **Specific:** (e.g., 'AirPods'). Find that item or the closest **functional** alternative.\n"
-            "2. **Relevance Hierarchy (Follow Strictly):**\n"
+            "### CRITICAL RULES:\n"
+            "1. **STRICTLY USE INVENTORY ONLY:** You **MUST NOT** mention or recommend any products or brands that are not explicitly listed in the '*** INVENTORY ***' section provided to you. If the inventory is irrelevant, apologize and state, 'I couldn't find a direct match in our inventory.'\n"
+            "2. **MATCH ANSWER TO GRID:** Select the top **2 to 3 best-fitting items** from the inventory and describe them in your response. The products you describe **MUST** be the ones that will appear in the product grid below your text response.\n"
+            "3. **Relevance Hierarchy (Follow Strictly):**\n"
             "   - **Tier 1 (Direct Match):** 'AirPods', 'Headphones', 'Earbuds'. -> SHOW THESE FIRST.\n"
             "   - **Tier 2 (Functional Fallback):** If NO Headphones exist, look for **Audio Gear** (e.g., 'Speakers', 'Soundbars'). -> SHOW THESE with a note ('I don't have headphones, but here are some speakers...').\n"
             "   - **Tier 3 (Irrelevant):** 'Drone', 'Air Filter', 'Airplane'. -> **NEVER SHOW THESE** for headphone requests.\n"
-            "3. **STRICT FORMATTING:**\n"
+            "4. **STRICT FORMATTING:** Use the **EXACT** Name, Description, Image_URL, and Link from the inventory list.\n"
             "   - **Name:** [Exact Product Name]\n"
             "   - **Description:** [Description]\n"
-            "   - **Image:** `![Product Name](Image_URL)`\n"  # <--- UPDATED: UNCOMMENTED THIS LINE
+            "   - **Image:** `![Product Name](Image_URL)`\n"
             "   - **Link:** `[View on Amazon](Product_URL)`"
         )
+        
+        # --- MAJOR FIX: REFINE CONTEXT INTRO ---
         context_intro = (
             f"The user is searching for '{optimized_query}' (Original input: {user_query}). "
-            "Scan the inventory below. "
+            "**Your task is to select the 2-3 most relevant items from the inventory list below** and present them in your response using the required strict markdown format. "
             "Prioritize FUNCTION over text matches (e.g., reject 'Air Drones' if user wants 'AirPods')."
         )
 
