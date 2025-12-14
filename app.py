@@ -10,7 +10,7 @@ import pandas as pd
 import faiss
 import pickle
 import torch
-import numpy as np # Added for type safety
+import numpy as np
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 from sentence_transformers import CrossEncoder
@@ -29,48 +29,46 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for "Fancy" UI (Glassmorphism + Hover Effects)
+# Custom CSS for "Fancy" UI
 st.markdown("""
 <style>
-    /* Global Background tweaks (optional, keeps Streamlit dark mode) */
-
     /* Chat Message Bubble Styling */
     .stChatMessage {
         border-radius: 12px;
         border: 1px solid rgba(255, 255, 255, 0.1);
     }
 
-    /* THE PRODUCT CARD - The core of the fancy UI */
+    /* THE PRODUCT CARD */
     .product-card {
-        background: rgba(40, 40, 45, 0.6); /* Semi-transparent dark */
-        backdrop-filter: blur(10px);        /* Glass blur effect */
+        background: rgba(40, 40, 45, 0.6);
+        backdrop-filter: blur(10px);
         border-radius: 16px;
         padding: 16px;
         margin-bottom: 24px;
         border: 1px solid rgba(255, 255, 255, 0.1);
         box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
         transition: all 0.3s ease-in-out;
-        height: 380px; /* Fixed height for alignment */
+        height: 380px; 
         display: flex;
         flex-direction: column;
         justify-content: space-between;
     }
 
-    /* Hover Effect: Lift up and Glow */
+    /* Hover Effect */
     .product-card:hover {
         transform: translateY(-8px);
         box-shadow: 0 10px 20px rgba(0, 0, 0, 0.4);
-        border-color: #FF4B4B; /* Streamlit Red Accent */
+        border-color: #FF4B4B; 
     }
 
-    /* Image Container to keep images proportional */
+    /* Image Container */
     .img-container {
         width: 100%;
         height: 180px;
         border-radius: 10px;
         overflow: hidden;
         margin-bottom: 12px;
-        background-color: #fff; /* White bg for product images */
+        background-color: #fff;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -89,7 +87,6 @@ st.markdown("""
         color: #f0f0f0;
         margin-bottom: 8px;
         line-height: 1.4;
-        /* Truncate text after 2 lines */
         display: -webkit-box;
         -webkit-line-clamp: 2;
         -webkit-box-orient: vertical;
@@ -138,6 +135,7 @@ def load_system_resources():
     filename = "Cleaned amazon dataset.csv"
     if os.path.exists(filename):
         df = pd.read_csv(filename)
+        # Ensure combined_text exists
         if 'combined_text' not in df.columns:
             def create_rich_text(row):
                 desc = str(row['full_description']) if pd.notna(row['full_description']) else ""
@@ -150,17 +148,19 @@ def load_system_resources():
         return None
 
     # B. Load AI Models
-    # Force CPU to avoid Mac MPS crash
-    device = "cpu"
+    device = "cpu" # Force CPU to avoid Mac MPS crash
     resources['device'] = device
 
     with st.spinner(f"Initializing AI Core (Device: {device})..."):
+        # CLIP for Embeddings
         model_name = "openai/clip-vit-base-patch32"
         resources['clip_model'] = CLIPModel.from_pretrained(model_name).to(device)
         resources['clip_processor'] = CLIPProcessor.from_pretrained(model_name)
 
-        rerank_device = device # Keep consistency
-        resources['reranker'] = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', device=rerank_device)
+        # --- KEY UPGRADE: BGE-RERANKER ---
+        # SOTA model for context & negation
+        rerank_device = device
+        resources['reranker'] = CrossEncoder('BAAI/bge-reranker-base', device=rerank_device)
 
     # C. Load FAISS Indexes
     if os.path.exists("text.index"):
@@ -186,17 +186,19 @@ sys_res = load_system_resources()
 
 
 # -----------------------------------------------------------------------------
-# 3. BACKEND LOGIC
+# 3. BACKEND LOGIC (OPTIMIZED)
 # -----------------------------------------------------------------------------
 
-# --- UPDATED: Added 'search_target' parameter to support switching indexes ---
 def retrieve_products(query, input_type="text", search_target="text_index", k=5):
+    """
+    Core FAISS retrieval.
+    """
     if sys_res['text_index'] is None: return pd.DataFrame()
 
     results = pd.DataFrame()
     device = sys_res['device']
 
-    # 1. Generate Embedding based on Input Type
+    # 1. Generate Embedding
     if input_type == "text":
         inputs = sys_res['clip_processor'](text=[query], return_tensors="pt", padding=True).to(device)
         with torch.no_grad():
@@ -207,18 +209,15 @@ def retrieve_products(query, input_type="text", search_target="text_index", k=5)
             q_emb = sys_res['clip_model'].get_image_features(**inputs)
 
     q_emb = q_emb / q_emb.norm(p=2, dim=-1, keepdim=True)
-
-    # --- FIX: Cast to float32 to prevent FAISS Segfault ---
     q_emb_np = q_emb.cpu().detach().numpy().astype('float32')
 
-    # 2. Search the Requested Index (Target)
+    # 2. Search Target Index
     if search_target == "text_index":
         D, I = sys_res['text_index'].search(q_emb_np, k)
         results = sys_res['df'].iloc[I[0]]
 
     elif search_target == "image_index":
         D, I = sys_res['image_index'].search(q_emb_np, k)
-
         if len(sys_res['valid_indices']) > 0:
             mapped_indices = [sys_res['valid_indices'][i] for i in I[0]]
             results = sys_res['df'].iloc[mapped_indices]
@@ -226,17 +225,21 @@ def retrieve_products(query, input_type="text", search_target="text_index", k=5)
     return results
 
 
-def retrieve_and_rerank(query, mode="functional", k_final=5, k_initial=50):
-    # --- UPDATE: Logic to switch between Visual and Functional search ---
+def retrieve_and_rerank(query, mode="functional", k_final=5, k_initial=25):
+    """
+    Text-based Retrieval & Reranking.
+    OPTIMIZATION: Default k_initial is 25 (down from 50) for speed.
+    """
     if mode == "visual":
-        # Text Input -> Search Image Index (Finds items that "look like" the text)
-        return retrieve_products(query, input_type="text", search_target="image_index", k=k_final)
+        # Search Image Index (looks like X)
+        initial_results = retrieve_products(query, input_type="text", search_target="image_index", k=k_initial)
     else:
-        # Text Input -> Search Text Index (Standard)
+        # Search Text Index (is X)
         initial_results = retrieve_products(query, input_type="text", search_target="text_index", k=k_initial)
 
     if initial_results.empty: return initial_results
 
+    # Rerank with smart BGE model
     product_texts = initial_results['combined_text'].tolist()
     pairs = [[query, text] for text in product_texts]
 
@@ -250,31 +253,29 @@ def retrieve_and_rerank(query, mode="functional", k_final=5, k_initial=50):
 def generate_bot_response(user_query, image_input, api_key, chat_history):
     client = OpenAI(api_key=api_key)
 
-    # Build history string
-    history_str = ""
-    for msg in chat_history[-4:]:
-        history_str += f"{msg['role'].upper()}: {msg['content']}\n"
+    # --- 1. SMART HISTORY MANAGEMENT ---
+    # Fixes "Context Stickiness"
+    if image_input:
+        # Rule: Image Upload = HARD TOPIC SWITCH.
+        # Wipe history string to focus 100% on the image.
+        history_str = "" 
+    else:
+        # Build history string normally
+        history_str = ""
+        for msg in chat_history[-4:]:
+            history_str += f"{msg['role'].upper()}: {msg['content']}\n"
 
-    # --- UPDATED: Keeps your original logic but adds the [VISUAL] tag check ---
     def rewrite_query(user_input, history):
-        """
-        Standardizes and EXPANDS the user query to ensure the database finds relevant items.
-        NOW WITH CONTEXT AWARENESS.
-        """
         system_prompt = (
             "You are a Search Query Optimizer. "
-            "Your goal is to ensure the database finds relevant functional alternatives based on User Input and History.\n"
-            "### INSTRUCTIONS:\n"
-            "1. **Check for Topic Switch (CRITICAL):** Look at the 'Chat History'. If the user's new input implies a new topic (e.g., switched from 'skateboards' to 'rabbits'), IGNORE the old topic. Recency determines the topic.\n"
-            "2. **Remove Noise:** Delete polite phrases (e.g., 'show me', 'can I get').\n"
-            "3. **Expand Brands to Categories:**\n"
-            "   - Input: 'AirPods' -> Output: 'AirPods Earbuds Headphones In-Ear'\n"
-            "   - Input: 'iPhone' -> Output: 'iPhone Smartphone Mobile'\n"
-            "   - Input: 'GoPro' -> Output: 'GoPro Action Camera Video'\n"
-            "4. **Expand Categories:**\n"
-            "   - Input: 'Skateboard' -> Output: 'Skateboard Longboard Cruiser Deck'\n"
-            "5. **(NEW) DETECT VISUAL INTENT:** If the user describes appearance (e.g., 'looks like', 'red', 'modern style', 'shape'), prepend `[VISUAL]` to your output. Otherwise, prepend `[FUNCTIONAL]`.\n"
-            "6. Output ONLY the final optimized search string."
+            "Your goal is to ensure the database finds relevant functional alternatives.\n"
+            "### RULES:\n"
+            "1. **Analyze Context:** Look at 'Chat History'. \n"
+            "   - If User Input is a **FOLLOW-UP** (e.g., 'cheaper', 'what about the second one'), MERGE it with previous topic.\n"
+            "   - If User Input is a **NEW TOPIC** (e.g., switched from 'shoes' to 'laptop'), IGNORE history.\n"
+            "2. **Remove Noise:** Delete polite phrases.\n"
+            "3. **Visual Intent:** If user describes looks/shape/color, prepend `[VISUAL]`.\n"
+            "4. **Output:** The final optimized search string ONLY."
         )
 
         try:
@@ -282,26 +283,51 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
                 model="gpt-3.5-turbo",
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"CHAT HISTORY (Oldest to Newest):\n{history}\n\nUSER INPUT: {user_input}"}
+                    {"role": "user", "content": f"CHAT HISTORY:\n{history}\n\nUSER INPUT: {user_input}"}
                 ],
                 temperature=0
             )
-            cleaned_query = response.choices[0].message.content.strip()
-            print(f"DEBUG: Expanded Query: '{user_input}' -> '{cleaned_query}'")
-            return cleaned_query
+            return response.choices[0].message.content.strip()
         except:
             return f"[FUNCTIONAL] {user_input}"
 
-    # 1. Retrieval
+    # --- 2. RETRIEVAL STRATEGY (HYBRID + OPTIMIZED) ---
     if image_input:
-        retrieved_products = retrieve_products(image_input, input_type="image", search_target="image_index", k=5)
-        sys_prompt = "You are a visual AI assistant. Identify the object in the image and recommend similar products."
-        context_intro = "I analyzed the uploaded image. Here are visually similar products from the inventory:"
-    else:
-        # Pass history to rewriter
-        optimized_query_raw = rewrite_query(user_query, history_str)
+        # HYBRID RETRIEVAL (The Fix for Visual Tunnel Vision)
+        # We fetch fewer items per source (k=10) to keep reranking fast.
+        
+        # A. Visual Matches (Top 10)
+        visual_candidates = retrieve_products(image_input, input_type="image", search_target="image_index", k=10)
+        
+        # B. Text Matches (Top 10)
+        text_query = user_query if user_query.strip() else "product"
+        text_candidates = retrieve_products(text_query, input_type="text", search_target="text_index", k=10)
+        
+        # C. Combine & Deduplicate
+        # Concatenate and drop duplicates immediately
+        combined_candidates = pd.concat([visual_candidates, text_candidates])
+        combined_candidates = combined_candidates.drop_duplicates(subset=['Product Name'])
+        
+        if not combined_candidates.empty:
+            # D. Rerank the Combined Pool
+            product_texts = combined_candidates['combined_text'].tolist()
+            pairs = [[text_query, text] for text in product_texts]
+            
+            scores = sys_res['reranker'].predict(pairs)
+            combined_candidates['rerank_score'] = scores
+            
+            # Top 5 best matches
+            retrieved_products = combined_candidates.sort_values('rerank_score', ascending=False).head(5)
+        else:
+            retrieved_products = pd.DataFrame()
+            
+        sys_prompt_type = "You are a visual AI assistant."
+        context_intro = "I have analyzed the uploaded image and matched it against your text request. Here are the best matches from the inventory:"
 
-        # --- UPDATE: Parse the [VISUAL] tag ---
+    else:
+        # Standard Text Search
+        optimized_query_raw = rewrite_query(user_query, history_str)
+        
         if "[VISUAL]" in optimized_query_raw:
             search_mode = "visual"
             optimized_query = optimized_query_raw.replace("[VISUAL]", "").strip()
@@ -309,61 +335,58 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
             search_mode = "functional"
             optimized_query = optimized_query_raw.replace("[FUNCTIONAL]", "").strip()
 
-        retrieved_products = retrieve_and_rerank(optimized_query, mode=search_mode, k_final=5, k_initial=50)
+        # k_initial set to 25 inside function
+        retrieved_products = retrieve_and_rerank(optimized_query, mode=search_mode, k_final=5)
 
-        # Original System Prompt (Kept exactly as requested)
-        sys_prompt = (
-            "You are a helpful sales assistant. Your goal is to recommend the best products based on function.\n"
-            "### RULES:\n"
-            "1. **Determine Intent:**\n"
-            "   - **Broad:** (e.g., 'party'). Recommend **3 distinct options**.\n"
-            "   - **Specific:** (e.g., 'AirPods'). Find that item or the closest **functional** alternative.\n"
-            "2. **Relevance Hierarchy (Follow Strictly):**\n"
-            "   - **Tier 1 (Direct Match):** 'AirPods', 'Headphones', 'Earbuds'. -> SHOW THESE FIRST.\n"
-            "   - **Tier 2 (Functional Fallback):** If NO Headphones exist, look for **Audio Gear** (e.g., 'Speakers', 'Soundbars'). -> SHOW THESE with a note ('I don't have headphones, but here are some speakers...').\n"
-            "   - **Tier 3 (Irrelevant):** 'Drone', 'Air Filter', 'Airplane'. -> **NEVER SHOW THESE** for headphone requests.\n"
-            "3. **STRICT FORMATTING:**\n"
-            "   - **Name:** [Exact Product Name]\n"
-            "   - **Description:** [Description]\n"
-            "   - **Image:** `![Product Name](Image_URL)`\n"  # <--- UPDATED: UNCOMMENTED THIS LINE
-            "   - **Link:** `[View on Amazon](Product_URL)`"
-        )
+        sys_prompt_type = "You are a helpful sales assistant."
         context_intro = (
             f"The user is searching for '{optimized_query}' (Original input: {user_query}). "
-            "Scan the inventory below. "
-            "Prioritize FUNCTION over text matches (e.g., reject 'Air Drones' if user wants 'AirPods')."
+            "Scan the INVENTORY provided below."
         )
 
-    # 2. Context
+    # --- 3. GENERATION (CONTEXT ISOLATION) ---
+    # Prevents Hallucinations
+    sys_prompt = (
+        f"{sys_prompt_type} Your goal is to recommend products based STRICTLY on the provided inventory.\n"
+        "### CRITICAL RULES (Follow Strictly):\n"
+        "1. **Previous Chat History:** Use this ONLY to understand user preferences. **NEVER** recommend a product from the history unless it is also in the Current Inventory.\n"
+        "2. **Current Inventory:** This is your ONLY source of products. You must only recommend items listed in the '*** INVENTORY ***' section below.\n"
+        "3. **No Hallucinations:** If the inventory items do not match the user's request (e.g., user wants 'white', inventory is 'green'), you MUST admit it. DO NOT lie about the features.\n"
+        "4. **Strict Ordering:** Discuss the products in the exact order they appear in the Inventory.\n"
+        "5. **Format:**\n"
+        "   - **Item [X]:** [Product Name]\n"
+        "   - **Why it fits:** [Brief explanation grounded in reality]\n"
+        "   - **Image:** `![Product Name](Image_URL)`\n"
+        "   - **Link:** `[View on Amazon](Product_URL)`"
+    )
+
+    # 4. Context Building
     if retrieved_products.empty:
         return "I couldn't find any relevant products in the database.", retrieved_products
 
-    context_str = "*** INVENTORY ***\n"
+    context_str = "*** INVENTORY (THE ONLY VALID ITEMS) ***\n"
     for i, row in retrieved_products.iterrows():
+        raw_img_url = str(row['Image'])
+        clean_img_url = raw_img_url.split("|")[0] if "|" in raw_img_url else raw_img_url
+
         context_str += f"Item {i + 1}:\n"
         context_str += f"- Name: {row['Product Name']}\n"
         context_str += f"- Link: {str(row['Product Url'])}\n"
-
-        raw_img_url = str(row['Image'])
-        if "|" in raw_img_url:
-            clean_img_url = raw_img_url.split("|")[0]
-        else:
-            clean_img_url = raw_img_url
         context_str += f"- Image_URL: {clean_img_url}\n"
-
+        
         cat = str(row['Category']) if 'Category' in row else "General"
         desc = str(row['full_description']) if 'full_description' in row else str(row.get('About Product', ''))
         context_str += f"- Category: {cat}\n"
         context_str += f"- Description: {desc[:300]}...\n\n"
 
-    # 3. Generation
+    # 5. Final Call
     try:
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": sys_prompt},
-                # Pass History + Context
-                {"role": "user", "content": f"Previous Chat History:\n{history_str}\n\nContext:\n{context_str}\n\n{context_intro}\nUser Question: {user_query}"}
+                # Separation of History vs Inventory
+                {"role": "user", "content": f"PREVIOUS CHAT HISTORY (Context Only, NO Products):\n{history_str}\n\nCURRENT INVENTORY (Select Products from HERE):\n{context_str}\n\n{context_intro}\nUser Question: {user_query}"}
             ],
             temperature=0.3
         )
@@ -377,27 +400,19 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
 # -----------------------------------------------------------------------------
 
 def display_product_grid(df):
-    """
-    Renders the products in a perfect 3-column grid.
-    Fixes the vertical stacking issue.
-    """
     if df.empty:
         return
 
     st.markdown("### 🛍️ Recommended Products")
 
-    # Create the columns OUTSIDE the loop
     cols = st.columns(3)
 
     for i, (idx, row) in enumerate(df.iterrows()):
-        # Handle Amazon multi-images (split by |)
         raw_img = str(row['Image'])
         img_url = raw_img.split("|")[0] if "|" in raw_img else raw_img
 
         category = str(row['Category']) if 'Category' in row else "Product"
 
-        # Use HTML/CSS for the Fancy Card
-        # The key is using cols[i % 3] to cycle through columns 0, 1, 2
         with cols[i % 3]:
             st.markdown(f"""
             <div class="product-card">
@@ -422,17 +437,21 @@ with st.sidebar:
     st.title("⚙️ Control Panel")
     api_key = st.text_input("OpenAI API Key", type="password", help="Enter your SK- key here")
 
+    # --- RESET BUTTON ---
+    col1, col2 = st.columns([1,2])
+    if st.button("🗑️ Clear Chat", type="primary", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.uploader_key += 1
+        st.rerun()
+        
     st.divider()
 
     st.markdown("### 🖼️ Visual Search")
     st.info("Upload an image here, then hit Enter in the chat box to search.")
 
-    # --- FIX START: Session State to track Uploader Key ---
     if "uploader_key" not in st.session_state:
         st.session_state.uploader_key = 0
-    # --- FIX END ---
 
-    # --- FIX: Bind uploader to the unique key ---
     uploaded_file = st.file_uploader(
         "Upload Image...",
         type=["jpg", "png", "jpeg"],
@@ -447,7 +466,7 @@ with st.sidebar:
 
 # --- Main Chat Area ---
 st.title("🤖 AI Intelligent Shopper")
-st.caption("Powered by CLIP + RAG + LLM")
+st.caption("Powered by CLIP + RAG + LLM (BGE-Reranker)")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -462,10 +481,9 @@ for message in st.session_state.messages:
 
         if "products" in message and not message["products"].empty:
             st.markdown("---")
-            # CALL THE GRID FUNCTION TO ENSURE HORIZONTAL LAYOUT
             display_product_grid(message["products"])
 
-# --- Fixed Input at Bottom ---
+# --- Input Area ---
 prompt = st.chat_input("Ask about a product or describe what you need...")
 
 if prompt:
@@ -493,7 +511,6 @@ if prompt:
     with st.chat_message("assistant"):
         with st.spinner("Analyzing intent and searching inventory..."):
 
-            # --- UPDATE: Pass the history to the function ---
             response_text, products_df = generate_bot_response(
                 user_text,
                 user_image,
@@ -514,7 +531,7 @@ if prompt:
         "products": products_df
     })
 
-    # --- FIX: If an image was used, force a reset for the next run ---
+    # Reset uploader if an image was used to avoid duplicate triggers
     if user_image is not None:
         st.session_state.uploader_key += 1
         st.rerun()
