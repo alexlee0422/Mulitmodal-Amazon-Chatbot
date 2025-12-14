@@ -232,7 +232,6 @@ def retrieve_and_rerank(query, mode="functional", k_final=5, k_initial=25):
     """
     if mode == "visual":
         # Search Image Index (looks like X)
-        # This is where the magic happens for "looks like a mouse"
         initial_results = retrieve_products(query, input_type="text", search_target="image_index", k=k_initial)
     else:
         # Search Text Index (is X)
@@ -267,19 +266,16 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
             history_str += f"{msg['role'].upper()}: {msg['content']}\n"
 
     def rewrite_query(user_input, history):
-        # --- KEY UPDATE: INTEGRATED THE "VISUAL INTENT" PROMPT FROM THE OTHER CODE ---
         system_prompt = (
             "You are a Search Query Optimizer. "
-            "Your goal is to ensure the database finds relevant products based on User Input and History.\n"
-            "### INSTRUCTIONS:\n"
-            "1. **Check for Topic Switch (CRITICAL):** Look at the 'Chat History'. If the user's new input implies a new topic, IGNORE the old topic. Recency determines the topic.\n"
-            "2. **Remove Noise:** Delete polite phrases (e.g., 'show me', 'can I get').\n"
-            "3. **Expand Brands/Categories:** 'AirPods' -> 'AirPods Earbuds Headphones In-Ear'.\n"
-            "4. **(CRITICAL) DETECT VISUAL INTENT:** \n"
-            "   - If the user describes **appearance** (e.g., 'looks like a mouse', 'shaped like a banana', 'red color', 'modern style'), YOU MUST prepend `[VISUAL]` to your output.\n"
-            "   - If the user asks for **function** (e.g., 'wireless mouse', 'gaming laptop'), prepend `[FUNCTIONAL]`.\n"
-            "   - EXAMPLE: 'I want something that looks like a wireless mouse but isn't' -> `[VISUAL] object shaped like wireless mouse computer peripheral`\n"
-            "5. Output ONLY the final optimized search string."
+            "Your goal is to ensure the database finds relevant functional alternatives.\n"
+            "### RULES:\n"
+            "1. **Analyze Context:** Look at 'Chat History'. \n"
+            "   - If User Input is a **FOLLOW-UP** (e.g., 'cheaper', 'what about the second one'), MERGE it with previous topic.\n"
+            "   - If User Input is a **NEW TOPIC** (e.g., switched from 'shoes' to 'laptop'), IGNORE history.\n"
+            "2. **Remove Noise:** Delete polite phrases.\n"
+            "3. **Visual Intent:** If user describes looks/shape/color, prepend `[VISUAL]`.\n"
+            "4. **Output:** The final optimized search string ONLY."
         )
 
         try:
@@ -298,6 +294,7 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
     # --- 2. RETRIEVAL STRATEGY (HYBRID + OPTIMIZED) ---
     if image_input:
         # HYBRID RETRIEVAL (The Fix for Visual Tunnel Vision)
+        # We fetch fewer items per source (k=10) to keep reranking fast.
         
         # A. Visual Matches (Top 10)
         visual_candidates = retrieve_products(image_input, input_type="image", search_target="image_index", k=10)
@@ -307,6 +304,7 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
         text_candidates = retrieve_products(text_query, input_type="text", search_target="text_index", k=10)
         
         # C. Combine & Deduplicate
+        # Concatenate and drop duplicates immediately
         combined_candidates = pd.concat([visual_candidates, text_candidates])
         combined_candidates = combined_candidates.drop_duplicates(subset=['Product Name'])
         
@@ -330,7 +328,6 @@ def generate_bot_response(user_query, image_input, api_key, chat_history):
         # Standard Text Search
         optimized_query_raw = rewrite_query(user_query, history_str)
         
-        # --- PARSE THE TAGS (Logic from the other code) ---
         if "[VISUAL]" in optimized_query_raw:
             search_mode = "visual"
             optimized_query = optimized_query_raw.replace("[VISUAL]", "").strip()
@@ -538,3 +535,4 @@ if prompt:
     if user_image is not None:
         st.session_state.uploader_key += 1
         st.rerun()
+
